@@ -1,0 +1,21 @@
+[Unit]
+Description=llama-server (profile: full-128k) - primary daily-driver config
+Documentation=file:%h/llama-server/README.md
+# Only one profile should run at a time; starting this one stops the others.
+Conflicts=llama-server-full-256k.service llama-server-limited.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/llama-server
+# Tunables live outside the repo (installed by ../install.sh) so they
+# survive `git pull` / reclones; llm-server.sh treats a missing file as
+# "use built-in defaults" rather than an error, so this works even before
+# install.sh has been run.
+ExecStart=%h/llama-server/scripts/llm-server.sh --tunables-file %h/.config/llama-server/full-128k.env
+Restart=on-failure
+RestartSec=5
+# Model load (22GB, --no-mmap) plus KV cache allocation can take a while.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

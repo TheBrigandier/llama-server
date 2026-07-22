@@ -1,0 +1,20 @@
+# Model weights - never commit, keep the directory itself via models/.keep
+models/*
+!models/.keep
+
+# Secrets belong outside this repo (~/.config/llama-server/secrets.env);
+# these guard against one accidentally being created/committed here.
+*.env
+!*.env.example
+
+*.log
+*.pid
+nohup.out
+core
+core.*
+
+# editor/OS cruft
+*.swp
+*.swo
+*~
+.DS_Store

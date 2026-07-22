@@ -1,0 +1,19 @@
+[Unit]
+Description=llama-server (profile: limited) - reduced VRAM footprint, for sharing the GPU with a desktop session
+Documentation=file:%h/llama-server/README.md
+Conflicts=llama-server-full-128k.service llama-server-full-256k.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/llama-server
+# Tunables live outside the repo (installed by ../install.sh) so they
+# survive `git pull` / reclones; llm-server.sh treats a missing file as
+# "use built-in defaults" rather than an error, so this works even before
+# install.sh has been run.
+ExecStart=%h/llama-server/scripts/llm-server.sh --tunables-file %h/.config/llama-server/limited.env
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target
