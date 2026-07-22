@@ -143,6 +143,56 @@ without starting it.
   (or `--mmproj`). The script enforces this and will refuse to start
   otherwise.
 
+## Coding agent configs (example-configs/)
+
+```
+example-configs/
+└── opencode/
+    └── opencode.json   # OpenCode provider config for this server
+```
+
+`example-configs/<agent-name>/` holds ready-to-use client configs for
+coding agents that talk to this server over its OpenAI-compatible API
+(`http://localhost:8080/v1`). Currently just [OpenCode](https://opencode.ai/),
+but the same pattern is meant to extend to other agents (Claude Code,
+Continue, etc.) as they're set up against this server - each gets its own
+subdirectory here rather than scattering config in unrelated places.
+
+`opencode/opencode.json` defines **10 model profiles**: 5 sampling
+"flavors" (`thinking-general`, `thinking-coding`, `thinking-coding-hard`,
+`instruct-general`, `instruct-fast`) × 2 context sizes (`128k`/`256k`).
+The sampling values for each flavor are pulled directly from the model
+card's four published presets (see [About the model](#about-the-model) and
+[Sampling & MTP notes](#sampling--mtp-notes) above) - not guessed. The
+128k/256k split exists because OpenCode (like most OpenAI-compatible
+clients) has no way to query a server for its actual loaded context size;
+`limit.context` is a static, client-side-only value, so each flavor is
+materialized twice rather than risking a mismatch against whichever
+deployment (see [Deployments](#deployments-tunables-files)) happens to be
+running.
+
+These configs were validated against a real request, not just written from
+docs: with the server running, a differential test - temporarily launching
+it with distinctive sampling defaults that don't match any profile, then
+comparing `/slots`' actual applied params after a real request - confirmed
+every field in `opencode.json`'s `options` (including non-standard ones
+like `top_k`, `min_p`, and `repeat_penalty`) genuinely reaches llama-server
+rather than being silently dropped by the client. That process caught a
+real bug along the way: llama.cpp's field is `repeat_penalty`, not the
+`repetition_penalty` the file originally used, which llama-server was
+silently ignoring. Any future agent config added here should get the same
+treatment before being trusted, since different clients pass through
+non-standard OpenAI fields with varying (and sometimes broken) reliability.
+
+**`apiKey` must stay a placeholder in every file here** (currently
+`"CHANGE-ME"`) - these configs are meant to be safe to commit. Supply the
+real key through whatever secret-injection mechanism the agent supports
+(e.g. OpenCode's `{env:VAR_NAME}` config substitution) or a local,
+untracked copy - never paste the real value into a tracked file. If a real
+key is ever displayed anywhere outside `~/.config/llama-server/secrets.env`
+itself (a terminal, a log, a chat transcript), treat it as burned and
+rotate it - see [Secrets](#secrets) below.
+
 ## Secrets
 
 The API key (and anything else sensitive) is kept **outside this repo**, at:

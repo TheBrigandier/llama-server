@@ -85,6 +85,9 @@ systemd/*.service           user-level units, one per deployment, mutually Confl
                             each ExecStart passes --tunables-file for its deployment
 config/*.env.example        committed templates: secrets file + one per deployment
 models/                     gitignored weights, not otherwise touched by tooling here
+example-configs/<agent>/    committed client configs for coding agents that talk to this
+                            server (e.g. example-configs/opencode/opencode.json) - apiKey
+                            fields must stay placeholders, see conventions below
 ```
 
 ## Conventions when editing `scripts/llm-server.sh`
@@ -138,6 +141,53 @@ models/                     gitignored weights, not otherwise touched by tooling
   config scaffolding, never starts `llama-server`), then run it a second
   time to confirm the second run only prints "skip ... (already exists)"
   for the config files while still relinking + reloading the units.
+
+## Conventions when adding a coding-agent config (`example-configs/`)
+
+`example-configs/<agent-name>/` holds committed, ready-to-use client
+configs for coding agents that talk to this server. `opencode/opencode.json`
+is the reference example - follow its pattern for any new agent:
+
+- **Sampling values come from the model card's published presets, not
+  guesswork.** The card documents four: Thinking-general, Thinking-precise-coding,
+  Instruct-general, Instruct-reasoning (see `README.md`'s "About the
+  model" / "Sampling & MTP notes" for the exact numbers). If an agent's
+  config needs different profiles than OpenCode's, still derive the
+  sampling values from these same presets rather than inventing new ones.
+- **Never put a real API key in a tracked file.** `apiKey` (or equivalent)
+  must stay a placeholder like `"CHANGE-ME"` - real keys go through
+  whatever secret-injection mechanism the agent supports (env var
+  substitution, a local untracked override file, etc.), same principle as
+  `config/*.env.example` vs `~/.config/llama-server/secrets.env`.
+  `.gitignore` does *not* currently exclude `example-configs/**`, so
+  nothing stops a real key from being committed here except discipline -
+  check the diff before committing any file under this directory.
+- **Don't trust field names or client passthrough behavior from docs
+  alone - verify against a live server.** llama.cpp's field is
+  `repeat_penalty`, not the `repetition_penalty` this file originally
+  shipped with (silently ignored by the server, found only by testing).
+  Separately, whether a client actually forwards non-standard OpenAI
+  fields (`top_k`, `min_p`, `chat_template_kwargs`, `repeat_penalty`) to
+  the request body is client-specific and has had real bugs in the wild
+  (OpenCode has closed issues about custom-provider option passthrough).
+  The validation method used for `opencode.json`: temporarily set
+  distinctive sampling defaults in the active deployment's tunables file
+  (values that don't match any profile in the config being tested),
+  restart the service, fire one real request through the client, then
+  compare `/slots`' actual applied params against both the distinctive
+  server defaults and the profile's intended values - a match against the
+  profile that differs from the server default is unambiguous proof the
+  field reached the server. A match that's merely *consistent* with the
+  server's own default proves nothing (this tripped us up once - `/props`
+  alone isn't sufficient, it only shows the server's own CLI-baked
+  baseline). Revert the tunables file back afterward.
+- **Context size is a static, per-profile value, not auto-detected.** No
+  OpenAI-compatible client we've checked queries the server for its actual
+  loaded context (llama-server exposes it via `/props`, but that's a
+  llama.cpp-specific endpoint, not part of the OpenAI API surface clients
+  implement against). Mirror this repo's own `128k`/`256k` deployment split
+  rather than picking one static number, unless a specific agent is proven
+  to auto-detect it.
 
 ## Adding a new deployment
 
