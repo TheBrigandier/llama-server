@@ -1,0 +1,105 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local": {
+      "name": "Qwen3.6-35B-A3B-MTP (local)",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://192.168.101.100:8080/v1",
+        "apiKey": "CHANGE-ME"
+      },
+      "models": {
+        "qwen36-thinking-general": {
+          "name": "Qwen3.6 MTP - Thinking (general)",
+          "limit": { "context": 262144, "output": 32768 },
+          "options": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": { "preserve_thinking": true }
+          }
+        },
+        "qwen36-thinking-coding-256": {
+          "name": "Qwen3.6 MTP - 256k - Thinking (precise coding)",
+          "limit": { "context": 262144, "output": 32768 },
+          "options": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 0.3,
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": { "preserve_thinking": true }
+          }
+        },
+        "qwen36-thinking-coding-128": {
+          "name": "Qwen3.6 MTP - 128k - Thinking (precise coding)",
+          "limit": { "context": 131072, "output": 32768 },
+          "options": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 0.3,
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": { "preserve_thinking": true }
+          }
+        },
+        "qwen36-thinking-coding-hard": {
+          "name": "Qwen3.6 MTP - Thinking (precise coding, extended output)",
+          "limit": { "context": 262144, "output": 81920 },
+          "options": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": { "preserve_thinking": true }
+          }
+        },
+        "qwen36-instruct-general": {
+          "name": "Qwen3.6 MTP - Instruct (general)",
+          "limit": { "context": 262144, "output": 32768 },
+          "options": {
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repetition_penalty": 1.0
+          }
+        },
+        "qwen36-instruct-reasoning": {
+          "name": "Qwen3.6 MTP - Instruct (reasoning)",
+          "limit": { "context": 262144, "output": 32768 },
+          "options": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 40,
+            "min_p": 0.0,
+            "presence_penalty": 2.0,
+            "repetition_penalty": 1.0
+          }
+        },
+        "qwen36-instruct-fast": {
+          "name": "Qwen3.6 MTP - Instruct (fast, non-thinking, subagent-suited)",
+          "limit": { "context": 262144, "output": 8192 },
+          "options": {
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": { "enable_thinking": false }
+          }
+        }
+      }
+    }
+  },
+  "model": "local/qwen36-thinking-coding"
+}
