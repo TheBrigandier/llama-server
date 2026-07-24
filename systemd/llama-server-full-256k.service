@@ -18,13 +18,14 @@ TimeoutStartSec=300
 # runaway (this model's context-checkpoint bug or anything else) gets killed
 # and restarted by systemd instead of taking down the whole session via the
 # system-wide OOM killer. This profile's 262144 ctx means a bigger baseline
-# KV footprint than full-128k/limited (not directly measured) - these are
-# starting-point estimates and leave less desktop headroom by design, since
-# this deployment is meant for occasional use, not as the daily driver.
-# Watch `systemctl --user status llama-server-full-256k` peak memory and
-# adjust.
-MemoryHigh=27G
-MemoryMax=29G
+# KV footprint than full-128k/limited (not directly measured), and
+# cache-ram=8192 (see README's "Memory stability" section) adds up to ~8G
+# more on top in the worst case - these are starting-point estimates and
+# leave the least desktop headroom of the three by design, since this
+# deployment is meant for occasional use, not as the daily driver. Watch
+# `systemctl --user status llama-server-full-256k` peak memory and adjust.
+MemoryHigh=28G
+MemoryMax=30G
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop
 # session isn't.

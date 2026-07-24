@@ -17,13 +17,15 @@ TimeoutStartSec=300
 # Safety net for a desktop box also used for browsing: cap this cgroup so a
 # runaway (this model's context-checkpoint bug or anything else) gets killed
 # and restarted by systemd instead of taking down the whole session via the
-# system-wide OOM killer. Observed baseline for this profile is ~24G RSS at
-# idle right after model load (see README's "Memory stability" section) -
-# these numbers give some growth headroom above that; watch
-# `systemctl --user status llama-server-limited` peak memory and tighten
-# (or loosen) if it's consistently far from the ceiling.
-MemoryHigh=25G
-MemoryMax=27G
+# system-wide OOM killer. Observed baseline for this profile (checkpoints
+# disabled) is ~17-20G RSS - cache-ram=8192 (see README's "Memory
+# stability" section) means up to ~8G more on top of that in the worst
+# case, so these ceilings were raised to match rather than clipping
+# legitimate cache usage. Watch `systemctl --user status llama-server-limited`
+# peak memory and tighten (or loosen) if it's consistently far from the
+# ceiling.
+MemoryHigh=27G
+MemoryMax=29G
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop
 # session isn't.

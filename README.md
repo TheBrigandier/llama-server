@@ -328,50 +328,93 @@ On a desktop box also used for browsing, an unbounded `llama-server` is a
 real problem, not just an inefficiency - it can eat enough RAM to force
 swapping or trigger the system-wide OOM killer, which can take down
 anything (browser tabs, the desktop session) rather than just the server.
-Two llama-server mechanisms drive that growth here, and both are overridden
-away from llama-server's own defaults in every `config/*.env.example`:
+This repo handles two different things under that heading - a real bug
+that's pure overhead, and a legitimate cache whose size needs to match how
+this repo is actually used, not just be minimized.
 
-- **`--ctx-checkpoints`** (llama-server default: `32` per slot) saves
-  snapshots of KV/recurrent state so a request can rewind instead of
-  reprocessing from scratch. On this model's hybrid linear-attention/
-  gated-attention (Gated DeltaNet-style) architecture, checkpoints are
-  currently **known-broken upstream**: they get created (consuming RAM) but
-  are constantly invalidated and never successfully restored - see
-  [ggml-org/llama.cpp#24055](https://github.com/ggml-org/llama.cpp/issues/24055)
-  and [#19794](https://github.com/ggml-org/llama.cpp/issues/19794), both
-  filed against this exact model family. Until that's fixed upstream, this
-  repo sets `LLAMA_CTX_CHECKPOINTS=0` - pure memory overhead with no
-  restore benefit for this model as things stand. If a future llama.cpp
-  release fixes hybrid/recurrent checkpoint restore, it's worth
-  re-enabling (checkpoints are the mechanism behind fast multi-turn
-  prompt reuse) and re-testing.
-- **`--cache-ram`** (llama-server default: `8192` MiB) caps the prompt
-  cache, and normal multi-turn usage genuinely fills it - `journalctl
-  --user -u llama-server-<profile>` will show repeated `making room for
-  prompt cache entry, removing oldest entry` lines as it evicts to stay
-  under the cap. An 8GB cache on top of this model's baseline footprint
-  (which alone runs ~24GB+ on a 32GB box, see below) leaves no headroom for
-  the desktop session, so this repo sets `LLAMA_CACHE_RAM=1024`.
+### Context checkpoints: disabled, no tradeoff
 
-Even with both fixed, the model's baseline footprint alone is substantial:
-the `limited` deployment was observed at ~24GB RSS at idle right after
-model load on a 31GB-RAM machine, before any conversation activity. That's
-inherent to running a 22GB+ GGUF with several MoE layers CPU-resident
-(`-ncmoe`), not something these two flags can fix - if you need more
-desktop headroom than that leaves, the lever is raising `-ncmoe` further
-(more VRAM used, more speed given up) or, if you're on a bigger card,
-lowering `-ncmoe` isn't the direction that helps here since it *reduces*
-CPU RAM in favor of VRAM.
+**`--ctx-checkpoints`** (llama-server default: `32` per slot) saves
+snapshots of KV/recurrent state so a request can rewind instead of
+reprocessing from scratch. On this model's hybrid linear-attention/
+gated-attention (Gated DeltaNet-style) architecture, checkpoints are
+currently **known-broken upstream**: they get created (consuming RAM) but
+are constantly invalidated and never successfully restored - see
+[ggml-org/llama.cpp#24055](https://github.com/ggml-org/llama.cpp/issues/24055)
+and [#19794](https://github.com/ggml-org/llama.cpp/issues/19794), both
+filed against this exact model family. Confirmed directly against this
+repo's own logs, not just the upstream reports: not a single "checkpoint"
+or "restoring" log line appears anywhere in this server's history, and the
+exact same full-context-reprocess pattern (see below) happened identically
+before `LLAMA_CTX_CHECKPOINTS=0` was set as after. Until upstream fixes
+hybrid/recurrent checkpoint restore, this is pure memory overhead with no
+downside to disabling it. If a fix lands, it's worth re-enabling and
+re-testing (checkpoints are also the mechanism behind fast context-shift on
+`--context-shift`, unused here, and multi-turn prompt reuse in general).
 
-As a second layer of protection independent of getting the above tuning
-right, every `systemd/*.service` unit sets `MemoryHigh=`/`MemoryMax=`
-(cgroup memory caps, so a runaway gets killed and restarted by systemd
-instead of triggering the system-wide OOM killer) and `OOMScoreAdjust=500`
-(makes the kernel prefer killing this process over your desktop apps in a
-system-wide OOM, as a last resort). The specific numbers in each unit are
-starting points, not measured for every profile - watch `systemctl --user
-status llama-server-<profile>`'s peak memory column after real use and
-adjust if it's consistently far from (or dangerously close to) the ceiling.
+### Prompt cache (`--cache-ram`): sized for this repo's actual workload, not minimized
+
+**`--cache-ram`** (llama-server default: `8192` MiB) caps the prompt
+cache - the set of idle conversation branches kept ready to resume without
+reprocessing (`--cache-idle-slots`, default enabled). This repo briefly
+shipped `LLAMA_CACHE_RAM=1024` under the assumption that shrinking it was
+a pure memory-stability win with no other cost. It wasn't: with agentic
+coding workflows here running subagents sequentially (single slot,
+`--parallel 1`, required by `--spec-type draft-mtp`) and handing control
+back to an orchestrator, each orchestrator<->subagent branch needs to stay
+cached across the handoff to avoid a full reprocess. At 1024 MiB the cache
+couldn't hold both branches at once, and every handoff evicted one to make
+room for the other - turning a few-second cache hit into a 90+ second full
+reprocess of tens of thousands of tokens. Confirmed in this server's own
+logs: the rate of full (>10k token) reprocesses roughly doubled (6.65% of
+requests -> 12.5%) after the cut, at matched request throughput.
+
+The right number comes from what a single branch actually costs, computed
+from this GGUF's own architecture metadata (`qwen35moe`, read directly from
+the file - not guessed): `full_attention_interval=4` means only ~10-11 of
+41 layers are full attention (the rest are fixed-size recurrent/SSM state
+that doesn't grow with context at all); those full-attention layers have 2
+KV heads x 256-dim K/V each; at `q8_0` (1.0625 bytes/element after
+block-scale overhead), that's:
+
+```
+1024 elements/token/layer x 1.0625 bytes x ~10-11 layers  ~=  11 KiB/token
+262,144 tokens (this repo's max ctx) x 11 KiB/token       ~=  2.75 GiB/branch
+```
+
+`LLAMA_CACHE_RAM=8192` (llama-server's own default, restored rather than
+overridden) covers roughly **3 max-context branches resident at once** -
+orchestrator + active subagent + slack - which is why the upstream default
+turned out to already be a reasonable number for this shape of workload
+rather than something arbitrary to cut down.
+
+### Baseline footprint (not fixed by either flag above)
+
+Even with both of the above set well, the model's baseline footprint is
+substantial on its own: the `limited` deployment was observed at
+~17-20GB RSS with checkpoints disabled (before any `--cache-ram` growth),
+on a 31GB-RAM machine. That's inherent to running a 22GB+ GGUF with
+several MoE layers CPU-resident (`-ncmoe`), not something `--cache-ram` or
+`--ctx-checkpoints` can fix - if you need more desktop headroom than the
+current profile leaves, the lever is raising `-ncmoe` further (more VRAM
+used, more speed given up), and accept less multi-branch cache headroom by
+lowering `--cache-ram` back down with the tradeoff above in mind, rather
+than assuming there's a free reduction available.
+
+### systemd memory caps: the actual safety net
+
+As a layer of protection independent of getting the above tuning right,
+every `systemd/*.service` unit sets `MemoryHigh=`/`MemoryMax=` (cgroup
+memory caps, so a runaway gets killed and restarted by systemd instead of
+triggering the system-wide OOM killer) and `OOMScoreAdjust=500` (makes the
+kernel prefer killing this process over your desktop apps in a system-wide
+OOM, as a last resort). The specific numbers in each unit are sized for
+baseline-footprint-plus-up-to-8GB-cache, not measured for every profile -
+watch `systemctl --user status llama-server-<profile>`'s peak memory
+column after real use and adjust if it's consistently far from (or
+dangerously close to) the ceiling. Raising `--cache-ram` further than 8192
+without also raising these caps to match will make the cap the thing that
+kills the server under heavy multi-branch use, not a leak.
 
 ## Tuning for different hardware
 

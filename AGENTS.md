@@ -42,17 +42,30 @@ only the relevant `.env` file.
   value of `2` - this was tuned by testing on this model/hardware (good
   speedup at 4, accept rate falls off sharply at 5). Don't "fix" it back to
   match the card without new evidence.
-- **`LLAMA_CTX_CHECKPOINTS=0` / `LLAMA_CACHE_RAM=1024` are set in every
-  `config/*.env.example`**, overriding llama-server's own defaults (`32`
-  and `8192` respectively) - don't "fix" these back without new evidence.
-  This is a memory-stability workaround for two things: (1) context
-  checkpoints are known-broken upstream on this model's hybrid/recurrent
-  architecture (created but never successfully restored - see README's
-  "Memory stability" section and the linked llama.cpp issues), so they're
-  pure RAM overhead right now; (2) the 8192 MiB default cache-ram leaves no
-  headroom on a 32GB desktop box that's also used for browsing. If an
-  upstream fix lands for (1), re-enabling checkpoints and re-testing is
-  reasonable - don't just revert silently.
+- **`LLAMA_CTX_CHECKPOINTS=0` is set in every `config/*.env.example`**,
+  overriding llama-server's own default (`32`) - context checkpoints are
+  known-broken upstream on this model's hybrid/recurrent architecture
+  (created but never successfully restored - see README's "Memory
+  stability" section and the linked llama.cpp issues), confirmed against
+  this repo's own logs (zero "checkpoint"/"restoring" lines ever, same
+  full-reprocess pattern before and after disabling), so this is pure RAM
+  overhead with no tradeoff. If an upstream fix lands, re-enabling and
+  re-testing is reasonable - don't just revert silently.
+- **`LLAMA_CACHE_RAM=8192` is set explicitly in every `config/*.env.example`**
+  (matching llama-server's own default, not overriding it down). This repo
+  briefly shipped `1024` under the assumption that shrinking it was a free
+  memory-stability win - it wasn't: this repo's sequential-subagent
+  workflow (single slot, `--parallel 1`) needs the orchestrator's branch
+  and the active subagent's branch both resident in the prompt cache
+  across each handoff, and 1024 MiB couldn't hold both, turning fast
+  handoffs into 90+ second full reprocesses (measured: full-reprocess rate
+  roughly doubled at matched request throughput). See README's "Memory
+  stability" section for the per-branch cost calculation (derived from this
+  GGUF's own architecture metadata: ~11 KiB/token, ~2.75GiB per max-256k
+  branch) before changing this value - it's sized for ~3 resident branches,
+  not picked arbitrarily. If you do need to trade cache size for desktop
+  RAM, that's a real tradeoff to make deliberately (and adjust the systemd
+  `MemoryHigh`/`MemoryMax` caps accordingly), not a default to "clean up."
 - **Sampling defaults** (`temp=1.0, top_p=0.95, top_k=20,
   presence_penalty=1.5`) are always applied unless overridden - they come
   from the model card's "thinking mode" recommendation, not llama.cpp's
