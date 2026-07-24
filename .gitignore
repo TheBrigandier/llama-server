@@ -2,10 +2,13 @@
 models/*
 !models/.keep
 
-# Secrets belong outside this repo (~/.config/llama-server/secrets.env);
-# these guard against one accidentally being created/committed here.
+# Secrets belong outside this repo (~/.config/llama-server/secrets.env,
+# ~/.config/llama-server/api-keys); these guard against one accidentally
+# being created/committed here.
 *.env
 !*.env.example
+api-keys
+!api-keys.example
 
 *.log
 *.pid

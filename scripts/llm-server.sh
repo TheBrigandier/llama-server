@@ -25,6 +25,17 @@
 # whether or not `install.sh` has been run to create it - unlike an
 # explicitly-passed --secrets-file, which is an error if missing.
 #
+# The API key is the one exception to "secrets file holds secrets": it
+# lives in its own file (~/.config/llama-server/api-keys, plain
+# --api-key-file format, not shell) so key values are only ever read from
+# disk by llama-server itself - never placed in argv or a process
+# environment variable, where they'd be visible to any other process
+# running as this user via ps/systemctl status//proc/<pid>/environ.
+# --api-key/LLAMA_API_KEY still exist as a secondary override (e.g. for
+# one-off testing) and go via an exported environment variable, not argv -
+# see the api-key-file vs environment-variable comparison in README's
+# Secrets section for why the file is the preferred default.
+#
 # Run `llm-server.sh --help` for the full flag/env-var reference.
 
 set -euo pipefail
@@ -66,7 +77,17 @@ Options (each has a matching LLAMA_* environment variable, see below):
   --presence-penalty N      Presence penalty (default: 1.5)
   --host HOST               Bind address (default: 0.0.0.0)
   --port PORT               Bind port (default: 8080)
-  --api-key KEY              Bearer API key (normally set via secrets file)
+  --api-key-file PATH        File of bearer API keys, one per line, llama-server's
+                                own --api-key-file format (default:
+                                ~/.config/llama-server/api-keys). Preferred way to
+                                set the key - the path goes to llama-server as-is,
+                                key values are never read into this script.
+  --api-key KEY              Secondary override - a single bearer API key set
+                                directly (e.g. one-off testing), added on top of
+                                --api-key-file rather than replacing it. Passed to
+                                llama-server via the LLAMA_API_KEY environment
+                                variable, not argv, so it never appears in
+                                ps/systemctl status/--dry-run output.
   --mmap / --no-mmap        Enable/disable mmap (default: --no-mmap)
   --flash-attn on|off       Flash attention (default: on)
   --bin PATH                 llama-server binary (default: llama-server on PATH)
@@ -85,8 +106,8 @@ Environment variables (all optional, CLI flags win if both are set):
   LLAMA_PARALLEL, LLAMA_CACHE_TYPE_K, LLAMA_CACHE_TYPE_V, LLAMA_CACHE_RAM,
   LLAMA_CTX_CHECKPOINTS, LLAMA_SPEC_TYPE,
   LLAMA_SPEC_DRAFT_N_MAX, LLAMA_TEMP, LLAMA_TOP_P, LLAMA_TOP_K,
-  LLAMA_PRESENCE_PENALTY, LLAMA_HOST, LLAMA_PORT, LLAMA_API_KEY,
-  LLAMA_NO_MMAP (1/0), LLAMA_FLASH_ATTN, LLAMA_SERVER_BIN,
+  LLAMA_PRESENCE_PENALTY, LLAMA_HOST, LLAMA_PORT, LLAMA_API_KEY_FILE,
+  LLAMA_API_KEY, LLAMA_NO_MMAP (1/0), LLAMA_FLASH_ATTN, LLAMA_SERVER_BIN,
   LLAMA_TUNABLES_FILE, LLAMA_SECRETS_FILE, LLAMA_EXTRA_ARGS
 
 Tunables file and secrets file are both sourced as shell, before real
@@ -98,7 +119,9 @@ above:
     stages them to ~/.config/llama-server/<name>.env and the matching
     systemd unit already passes --tunables-file for you).
   - Secrets file defaults to ~/.config/llama-server/secrets.env (override
-    with --secrets-file); typically just sets LLAMA_API_KEY.
+    with --secrets-file); uncommon to need it now that the API key has its
+    own file (see --api-key-file above) - it's there for any other LLAMA_*
+    value you'd rather keep out of the repo/tunables files.
 
 Examples:
   llm-server.sh --dry-run
@@ -201,6 +224,7 @@ TOP_K="${LLAMA_TOP_K:-20}"
 PRESENCE_PENALTY="${LLAMA_PRESENCE_PENALTY:-1.5}"
 HOST="${LLAMA_HOST:-0.0.0.0}"
 PORT="${LLAMA_PORT:-8080}"
+API_KEY_FILE="${LLAMA_API_KEY_FILE:-$HOME/.config/llama-server/api-keys}"
 API_KEY="${LLAMA_API_KEY:-}"
 NO_MMAP="${LLAMA_NO_MMAP:-1}"
 FLASH_ATTN="${LLAMA_FLASH_ATTN:-on}"
@@ -230,6 +254,7 @@ while [[ $# -gt 0 ]]; do
     --presence-penalty) PRESENCE_PENALTY="$2"; shift 2 ;;
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --api-key-file) API_KEY_FILE="$2"; shift 2 ;;
     --api-key) API_KEY="$2"; shift 2 ;;
     --mmap) NO_MMAP=0; shift ;;
     --no-mmap) NO_MMAP=1; shift ;;
@@ -273,10 +298,24 @@ if [[ "$SPEC_TYPE" == draft-mtp* && "$PARALLEL" -gt 1 ]]; then
   exit 1
 fi
 
-if [[ -z "$API_KEY" && "$ALLOW_NO_API_KEY" -eq 0 ]]; then
+# A "configured" key file needs to exist and have at least one
+# non-comment, non-blank line - an unedited api-keys.example (all comments
+# plus the "change-me" placeholder) still counts as configured, same as
+# this repo's prior LLAMA_API_KEY="change-me" default did; this only
+# guards against a missing/empty file, not an unedited placeholder value.
+API_KEY_FILE_HAS_KEY=0
+if [[ -f "$API_KEY_FILE" ]] && grep -qE '^[^#[:space:]]' "$API_KEY_FILE" 2>/dev/null; then
+  API_KEY_FILE_HAS_KEY=1
+  perms="$(stat -c '%a' "$API_KEY_FILE" 2>/dev/null || echo '???')"
+  if [[ "$perms" != "600" && "$perms" != "400" ]]; then
+    echo "warning: $API_KEY_FILE has mode $perms - recommend 'chmod 600 $API_KEY_FILE'" >&2
+  fi
+fi
+
+if [[ -z "$API_KEY" && "$API_KEY_FILE_HAS_KEY" -eq 0 && "$ALLOW_NO_API_KEY" -eq 0 ]]; then
   cat >&2 <<EOF
-error: no API key set and the server binds to $HOST.
-Set LLAMA_API_KEY in $SECRETS_FILE, pass --api-key, or pass
+error: no API key configured and the server binds to $HOST.
+Put a key in $API_KEY_FILE (see --api-key-file), pass --api-key, or pass
 --allow-no-api-key to intentionally run without auth.
 EOF
   exit 1
@@ -300,7 +339,7 @@ cmd+=(--cache-ram "$CACHE_RAM" --ctx-checkpoints "$CTX_CHECKPOINTS")
 cmd+=(--spec-type "$SPEC_TYPE" --spec-draft-n-max "$SPEC_DRAFT_N_MAX")
 cmd+=(--temp "$TEMP" --top-p "$TOP_P" --top-k "$TOP_K" --presence-penalty "$PRESENCE_PENALTY")
 cmd+=(--jinja)
-[[ -n "$API_KEY" ]] && cmd+=(--api-key "$API_KEY")
+[[ "$API_KEY_FILE_HAS_KEY" -eq 1 ]] && cmd+=(--api-key-file "$API_KEY_FILE")
 cmd+=(--reasoning-preserve)
 cmd+=(--host "$HOST" --port "$PORT")
 if [[ -n "$EXTRA_ARGS" ]]; then
@@ -311,7 +350,13 @@ fi
 if [[ "$DRY_RUN" -eq 1 ]]; then
   printf '%q ' "${cmd[@]}"
   echo
+  [[ -n "$API_KEY" ]] && echo "note: LLAMA_API_KEY would also be exported into the environment (llama-server reads it directly - not shown here, not passed as --api-key, never appears in argv/ps/systemctl status)" >&2
   exit 0
 fi
 
+# Passed via environment, not --api-key on argv: llama-server reads
+# LLAMA_API_KEY itself (see --help's "(env: LLAMA_API_KEY)" on --api-key), so
+# this keeps the key out of argv - which is otherwise visible to any local
+# user via `ps`, /proc/<pid>/cmdline, and `systemctl status`.
+[[ -n "$API_KEY" ]] && export LLAMA_API_KEY="$API_KEY"
 exec "${cmd[@]}"

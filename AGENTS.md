@@ -60,10 +60,17 @@ only the relevant `.env` file.
   defaults→tunables→secrets→env→CLI precedence as everything else if you
   touch them.
 - **Never write real secrets into the repo.** The API key lives at
-  `~/.config/llama-server/secrets.env` (outside this directory, chmod
-  600), sourced at runtime by `scripts/llm-server.sh`. `config/*.env.example`
-  is the only `.env*` file that should ever be committed - `.gitignore`
-  guards the rest, keep it that way if you touch it.
+  `~/.config/llama-server/api-keys` (outside this directory, chmod 600,
+  llama-server's own `--api-key-file` format - one key per line, not
+  shell), passed to llama-server as a path via `--api-key-file` so key
+  values are never read into `scripts/llm-server.sh` itself, never argv,
+  never a process environment variable - see README's Secrets section for
+  why (closes a `/proc/*/environ` exposure that an earlier, since-reverted
+  version of this design had). `~/.config/llama-server/secrets.env` still
+  exists for anything else sensitive (uncommon). `config/*.example` (both
+  `config/*.env.example` and `config/api-keys.example`) are the only
+  example/template files that should ever be committed - `.gitignore`
+  guards the real ones, keep it that way if you touch it.
 - **systemd units are user-level (`systemctl --user`) on purpose**, not
   system units in `/etc/systemd/system`. No `User=`/`Group=` directives,
   paths use `%h` instead of a hardcoded home dir, `[Install]` targets
@@ -87,13 +94,18 @@ only the relevant `.env` file.
 ## Layout
 
 ```
-install.sh                 stages secrets.env + per-deployment .env files, symlinks
-                            systemd units into ~/.config/systemd/user/, daemon-reload.
-                            Safe to re-run - never overwrites existing config files.
+install.sh                 stages api-keys + secrets.env + per-deployment .env files,
+                            symlinks systemd units into ~/.config/systemd/user/,
+                            daemon-reload. Safe to re-run - never overwrites existing
+                            config files.
 scripts/llm-server.sh       launcher: one built-in default + tunables file + secrets file
-                            + env vars + CLI flags (that precedence order, later wins)
+                            + api-keys file + env vars + CLI flags (that precedence
+                            order, later wins - api-keys file is the exception, see
+                            README's Secrets section)
 systemd/*.service           user-level units, one per deployment, mutually Conflicts=,
                             each ExecStart passes --tunables-file for its deployment
+config/api-keys.example     committed template for the API key file (llama-server's
+                            own --api-key-file format, not shell)
 config/*.env.example        committed templates: secrets file + one per deployment
 models/                     gitignored weights, not otherwise touched by tooling here
 example-configs/<agent>/    committed client configs for coding agents that talk to this
@@ -143,11 +155,12 @@ example-configs/<agent>/    committed client configs for coding agents that talk
 
 ## Conventions when editing `install.sh`
 
-- Must stay idempotent: never overwrite an existing `secrets.env` or
-  `<name>.env` (only `cp` if the destination doesn't exist yet) - a user's
-  edits to their tunables need to survive a reclone. The systemd symlinks
-  and `daemon-reload` are fine to always re-run, since they're just
-  pointers back into the checkout, not user-editable state.
+- Must stay idempotent: never overwrite an existing `api-keys`,
+  `secrets.env`, or `<name>.env` (only `cp` if the destination doesn't
+  exist yet) - a user's edits to their tunables (and their real API key)
+  need to survive a reclone. The systemd symlinks and `daemon-reload` are
+  fine to always re-run, since they're just pointers back into the
+  checkout, not user-editable state.
 - Test by actually running it (it's cheap and reversible - it only creates
   config scaffolding, never starts `llama-server`), then run it a second
   time to confirm the second run only prints "skip ... (already exists)"

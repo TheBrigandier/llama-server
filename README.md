@@ -195,28 +195,73 @@ rotate it - see [Secrets](#secrets) below.
 
 ## Secrets
 
-The API key (and anything else sensitive) is kept **outside this repo**, at:
+Anything sensitive is kept **outside this repo**, under
+`~/.config/llama-server/`. There are two separate files, because the API
+key gets different treatment from everything else:
 
 ```
-~/.config/llama-server/secrets.env
+~/.config/llama-server/api-keys      # the API key(s) - see below
+~/.config/llama-server/secrets.env   # anything else sensitive (uncommon)
 ```
 
-`install.sh` stages this from `config/llama-server.env.example` with mode
-`600` if it doesn't already exist. To do it by hand instead:
+`install.sh` stages both (from `config/api-keys.example` and
+`config/llama-server.env.example`, mode `600`) if they don't already
+exist. To do it by hand instead:
 
 ```sh
 mkdir -p ~/.config/llama-server
 chmod 700 ~/.config/llama-server
+cp config/api-keys.example ~/.config/llama-server/api-keys
+chmod 600 ~/.config/llama-server/api-keys
+$EDITOR ~/.config/llama-server/api-keys   # replace "change-me" with a real key
+
 cp config/llama-server.env.example ~/.config/llama-server/secrets.env
 chmod 600 ~/.config/llama-server/secrets.env
-$EDITOR ~/.config/llama-server/secrets.env   # set LLAMA_API_KEY
 ```
 
-`llm-server.sh` sources this file automatically (it's a plain shell script,
-so it can set any `LLAMA_*` variable, not just the key) and warns if its
-permissions are looser than `600`. The server binds to `0.0.0.0`, so the
-script refuses to start without an API key unless you pass
-`--allow-no-api-key` explicitly.
+The server binds to `0.0.0.0`, so `llm-server.sh` refuses to start without
+a key configured unless you pass `--allow-no-api-key` explicitly.
+
+### Why the API key gets its own file
+
+`~/.config/llama-server/api-keys` is llama-server's own `--api-key-file`
+format (one key per line, `#` comments, **not** a shell script like
+`secrets.env`) - `llm-server.sh` passes the path straight through via
+`--api-key-file`. This means key values are never read into the script at
+all, and never become a CLI argument or a process environment variable -
+they're only ever read from disk, by llama-server itself.
+
+That matters because the alternative - putting the key in an environment
+variable, which was this repo's first fix for the problem below - closes
+one leak but opens a narrower one: an env var is readable via
+`/proc/<pid>/environ` by any process running as the same user (or root),
+for as long as the server runs. On a single-user desktop that's not a
+useful boundary against a targeted attacker who already has code execution
+as your user (they could just read `secrets.env` or `api-keys` directly
+either way), but it *is* a real difference against generic,
+opportunistic credential-stealing malware, which commonly scans
+`/proc/*/environ` across all processes for anything that looks like a
+secret - env vars are a common place tools put them, precisely because
+so many tools use exactly the pattern this repo used to. A file at an
+app-specific path doesn't get picked up by that kind of scan. Neither
+approach protects against reading `secrets.env`/`api-keys` directly, or
+against a core dump if the server ever crashes while the key is loaded in
+memory - those risks are identical either way, since the key still has to
+live in the process's own memory once loaded, however it got there.
+
+Originally the key lived in `secrets.env` (as `LLAMA_API_KEY="..."`,
+sourced into the environment) alongside everything else - it moved out
+into its own file specifically to close the `/proc/*/environ` exposure.
+`--api-key`/`LLAMA_API_KEY` still exist as a secondary override (e.g. for
+one-off testing without touching the file) and still go via an exported
+environment variable, not argv - so they're better than the old default
+but not as good as the file, and are additive on top of `api-keys` rather
+than replacing it.
+
+**Practical rule regardless of mechanism:** if a key is ever displayed
+anywhere outside `api-keys`/`secrets.env` themselves (a terminal, a log, a
+chat transcript, `systemctl status` output before this fix existed), treat
+it as burned and rotate it.
 
 ## systemd (user service)
 

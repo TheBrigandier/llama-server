@@ -1,0 +1,27 @@
+# Template for llm-server.sh's --api-key-file.
+#
+# This file is an example only - it is safe to commit to git. The real
+# file must live OUTSIDE this repo, at:
+#
+#   ~/.config/llama-server/api-keys
+#
+# Format: llama-server's own --api-key-file format, not a shell script -
+# one key per line, lines starting with # are comments. Despite this
+# repo's single-user setup normally only needing one, the file (and
+# llama-server's --api-key-file flag) supports multiple keys - one per
+# line - if you ever want more than one valid credential (e.g. a separate
+# key per client), hence the plural filename.
+#
+# This file is passed straight through to llama-server as a path
+# (--api-key-file PATH), so key values themselves never become a CLI
+# argument or a process environment variable - only readable by opening
+# the file, same as any other 600-permissioned secret.
+#
+# Setup:
+#   mkdir -p ~/.config/llama-server
+#   chmod 700 ~/.config/llama-server
+#   cp config/api-keys.example ~/.config/llama-server/api-keys
+#   chmod 600 ~/.config/llama-server/api-keys
+#   $EDITOR ~/.config/llama-server/api-keys
+
+change-me
