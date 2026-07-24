@@ -62,3 +62,42 @@ turned out to be wrong, not just conservative:
   (the same full-reprocess pattern existed even before they were disabled,
   and zero checkpoint-restore log lines exist anywhere in this server's
   history, before or after).
+
+## 2026-07-24
+
+**`--cache-ram`/memory caps split per-deployment** - raising `cache-ram` to
+8192 on all three deployments (yesterday's fix) worked for handoff speed,
+but real usage showed a new problem: `full-128k`'s (and presumably
+`full-256k`'s) `MemoryHigh` ceiling was too tight for that cache size -
+`memory.events`' `high` counter had climbed into the thousands within
+~2 hours of normal use, repeatedly throttling the cgroup into (fast,
+zram-backed) swap. Not a crash (`MemoryMax`/`oom` never fired), but
+frequent, avoidable pressure from the ceiling being sized too close to
+what `cache-ram=8192` actually needs.
+
+- `full-128k`: `MemoryHigh`/`MemoryMax` raised `26G/28G` -> `28G/30G`.
+- `full-256k`: raised only `28G/30G` -> `29G/30G` (smaller bump on
+  purpose - total system RAM is 31Gi, and going further would leave so
+  little floor that the cap would stop being a meaningful safety net for
+  this profile).
+- `limited`, by contrast, got its cache *shrunk* rather than its ceiling
+  raised: this profile is only ever run at 128k context with strictly
+  sequential (never parallel) agents, so it only ever needs ~2 resident
+  branches, not the ~3+ the other two are provisioned for.
+  `LLAMA_CACHE_RAM` set to `3072` (down from `8192`) and
+  `MemoryHigh`/`MemoryMax` first lowered to `22G/24G` to match - giving
+  that RAM back to the desktop session `limited` is specifically meant to
+  share with, rather than reserving headroom it doesn't need.
+- **That `22G/24G` was wrong, caught within the same session**: it sat
+  the cgroup flush against `MemoryHigh` with zero cushion, so `memory.
+  events`' `high` counter climbed into the tens of thousands within ~2
+  minutes at idle - and a flat reading at exactly the ceiling turned out to
+  be `memory.high` itself forcibly capping growth via reclaim, not the real
+  resting size (a methodological trap - see README's "Memory stability"
+  section). Raised to `25G/27G` and it settled on its own at ~17-18GiB with
+  zero throttling, matching this repo's original baseline estimate from
+  before the tight cap muddied the measurement.
+- Per-branch cost math (from README's "Memory stability" section) now
+  shown per-deployment rather than a single number, since `full-256k`'s
+  max-256k branches (~2.75GiB each) cost roughly double `limited`'s
+  max-128k branches (~1.4GiB each).

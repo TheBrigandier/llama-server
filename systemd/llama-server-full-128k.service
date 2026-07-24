@@ -22,11 +22,15 @@ TimeoutStartSec=300
 # system-wide OOM killer. This profile's baseline RAM hasn't been directly
 # measured (fewer ncmoe layers stay on CPU here than limited's, so likely
 # somewhat lower) - cache-ram=8192 (see README's "Memory stability"
-# section) means up to ~8G more on top of baseline in the worst case, so
-# these are starting-point estimates sized for that. Watch
+# section) means up to ~8G more on top of baseline in the worst case.
+# Raised from 26G/28G after observing `limited` (same cache-ram=8192 at the
+# time) repeatedly hit its MemoryHigh ceiling in real use (memory.events
+# "high" counter in the thousands) and get pushed into swap purely from
+# throttling, not an actual leak - these ceilings give real headroom above
+# that same worst case instead of penalizing normal cache usage. Watch
 # `systemctl --user status llama-server-full-128k` peak memory and adjust.
-MemoryHigh=26G
-MemoryMax=28G
+MemoryHigh=28G
+MemoryMax=30G
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop
 # session isn't.

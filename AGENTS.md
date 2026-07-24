@@ -51,21 +51,53 @@ only the relevant `.env` file.
   full-reprocess pattern before and after disabling), so this is pure RAM
   overhead with no tradeoff. If an upstream fix lands, re-enabling and
   re-testing is reasonable - don't just revert silently.
-- **`LLAMA_CACHE_RAM=8192` is set explicitly in every `config/*.env.example`**
-  (matching llama-server's own default, not overriding it down). This repo
-  briefly shipped `1024` under the assumption that shrinking it was a free
-  memory-stability win - it wasn't: this repo's sequential-subagent
-  workflow (single slot, `--parallel 1`) needs the orchestrator's branch
-  and the active subagent's branch both resident in the prompt cache
-  across each handoff, and 1024 MiB couldn't hold both, turning fast
-  handoffs into 90+ second full reprocesses (measured: full-reprocess rate
-  roughly doubled at matched request throughput). See README's "Memory
-  stability" section for the per-branch cost calculation (derived from this
-  GGUF's own architecture metadata: ~11 KiB/token, ~2.75GiB per max-256k
-  branch) before changing this value - it's sized for ~3 resident branches,
+- **`LLAMA_CACHE_RAM` is set explicitly in every `config/*.env.example`, but
+  is NOT the same value across all three** - don't "consolidate" it back to
+  one number. `full-128k`/`full-256k` use `8192` (llama-server's own
+  default, matching rather than overriding it down). `limited` uses `3072`
+  - deliberately smaller, because that profile is only ever run at 128k
+  context with strictly sequential (never parallel) agents, so it only
+  ever needs ~2 resident branches (orchestrator + one active subagent)
+  where the other two profiles are provisioned for ~3+. This repo briefly
+  shipped `1024` on all three under the assumption that shrinking it was a
+  free memory-stability win - it wasn't: this repo's sequential-subagent
+  workflow needs the orchestrator's branch and the active subagent's
+  branch both resident in the prompt cache across each handoff, and 1024
+  MiB couldn't hold both, turning fast handoffs into 90+ second full
+  reprocesses (measured: full-reprocess rate roughly doubled at matched
+  request throughput). See README's "Memory stability" section for the
+  per-branch cost calculation (derived from this GGUF's own architecture
+  metadata: ~11 KiB/token, ~1.4GiB per max-128k branch, ~2.75GiB per
+  max-256k branch) and the per-deployment table before changing any of
+  these values - they're sized for each deployment's actual branch count,
   not picked arbitrarily. If you do need to trade cache size for desktop
-  RAM, that's a real tradeoff to make deliberately (and adjust the systemd
-  `MemoryHigh`/`MemoryMax` caps accordingly), not a default to "clean up."
+  RAM on `full-128k`/`full-256k`, that's a real tradeoff to make
+  deliberately (and adjust the systemd `MemoryHigh`/`MemoryMax` caps to
+  match - see the next bullet), not a default to "clean up."
+- **systemd `MemoryHigh`/`MemoryMax` differ per deployment and aren't
+  arbitrary either** - `full-128k` (28G/30G) and `full-256k` (29G/30G) are
+  sized for baseline + up to their 8192 MiB cache; `limited` (25G/27G) is
+  *lower*, matching its smaller 3072 MiB cache so that RAM goes back to the
+  desktop instead of sitting reserved. `full-256k`'s bump is smaller than
+  `full-128k`'s on purpose: total system RAM is 31Gi, and pushing
+  `MemoryMax` much higher would leave so little floor that the cgroup could
+  never actually hit its own cap before the whole system hit global memory
+  exhaustion first - don't push any of these caps to within ~1Gi of total
+  system RAM. See README's "Memory stability" section for the
+  `memory.events` `high`-counter evidence that motivated raising
+  `full-128k`/`full-256k` in the first place (throttling from
+  `cache-ram=8192` needing more headroom, not an actual leak).
+- **Don't trust a cgroup sitting flat at exactly its own `MemoryHigh` value
+  as proof that's the real resting footprint** - `MemoryHigh` actively
+  reclaims to hold usage at/below itself, so a process pinned there (even
+  through a test workload) can just mean the ceiling is too tight and
+  fighting it back down, not that it's genuinely settled. Check
+  `memory.events`' `high` counter (climbing fast = still being throttled)
+  or temporarily raise the ceiling and see where it actually rests. This is
+  exactly how `limited`'s `MemoryHigh` first got set to `22G` (looked
+  "confirmed flat" at 22.0GiB, `high` events were climbing into the tens of
+  thousands within 2 minutes at idle) before being corrected to `25G`,
+  where it settled on its own at ~17-18GiB with zero throttling.
 - **Sampling defaults** (`temp=1.0, top_p=0.95, top_k=20,
   presence_penalty=1.5`) are always applied unless overridden - they come
   from the model card's "thinking mode" recommendation, not llama.cpp's

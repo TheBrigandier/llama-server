@@ -17,15 +17,30 @@ TimeoutStartSec=300
 # Safety net for a desktop box also used for browsing: cap this cgroup so a
 # runaway (this model's context-checkpoint bug or anything else) gets killed
 # and restarted by systemd instead of taking down the whole session via the
-# system-wide OOM killer. Observed baseline for this profile (checkpoints
-# disabled) is ~17-20G RSS - cache-ram=8192 (see README's "Memory
-# stability" section) means up to ~8G more on top of that in the worst
-# case, so these ceilings were raised to match rather than clipping
-# legitimate cache usage. Watch `systemctl --user status llama-server-limited`
-# peak memory and tighten (or loosen) if it's consistently far from the
-# ceiling.
-MemoryHigh=27G
-MemoryMax=29G
+# system-wide OOM killer. Unlike full-128k/full-256k, this profile's
+# cache-ram is deliberately kept small (3072 MiB, not 8192 - see
+# limited.env's own comments and README's "Memory stability" section: this
+# is the profile for sharing RAM with a desktop session, so its ceiling
+# gives that RAM back rather than reserving it for a 3-branch cache this
+# profile never needs).
+#
+# An earlier MemoryHigh=22G looked "confirmed" at a flat 22.0GiB via
+# `systemctl show -p MemoryCurrent` (idle and during a test generation
+# alike) - but that flatness was `memory.high` itself artificially
+# capping growth via continuous reclaim (that's how memory.high works: it
+# keeps reclaiming to hold usage at/below the threshold), not the real
+# resting footprint. memory.events' "high" counter had climbed into the
+# tens of thousands within ~2 minutes at idle, confirming it was being
+# fought back down rather than genuinely settling there. Raising the
+# ceiling to 25G/27G let it actually settle: idle steady-state (model +
+# ncmoe layers + active slot's KV reservation + cache-ram=3072MiB) is
+# really ~17-18GiB, matching this repo's earlier baseline estimate before
+# the 22G cap muddied the measurement. Watch `systemctl --user status
+# llama-server-limited` peak memory and `memory.events`'s "high" count,
+# and tighten (or loosen) if it's consistently far from the ceiling or
+# throttling again.
+MemoryHigh=25G
+MemoryMax=27G
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop
 # session isn't.

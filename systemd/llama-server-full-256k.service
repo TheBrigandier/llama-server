@@ -20,11 +20,20 @@ TimeoutStartSec=300
 # system-wide OOM killer. This profile's 262144 ctx means a bigger baseline
 # KV footprint than full-128k/limited (not directly measured), and
 # cache-ram=8192 (see README's "Memory stability" section) adds up to ~8G
-# more on top in the worst case - these are starting-point estimates and
-# leave the least desktop headroom of the three by design, since this
-# deployment is meant for occasional use, not as the daily driver. Watch
-# `systemctl --user status llama-server-full-256k` peak memory and adjust.
-MemoryHigh=28G
+# more on top in the worst case - these leave the least desktop headroom of
+# the three by design, since this deployment is meant for occasional use,
+# not as the daily driver.
+#
+# Only bumped +1G/unchanged (not the same +2G as full-128k) despite the
+# same "don't penalize cache-ram=8192 with throttling" motivation: total
+# system RAM is 31Gi, and MemoryMax=30G already leaves only ~1Gi as a hard
+# floor. Going higher would mean the cgroup could never actually reach its
+# own "limit" before the whole system hit global memory exhaustion first -
+# making the safety net meaningless for this profile specifically. Watch
+# `systemctl --user status llama-server-full-256k` peak memory and adjust
+# down if it's tripping the ceiling, since there's little room left to
+# raise it further on this box.
+MemoryHigh=29G
 MemoryMax=30G
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop

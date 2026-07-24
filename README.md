@@ -352,22 +352,23 @@ downside to disabling it. If a fix lands, it's worth re-enabling and
 re-testing (checkpoints are also the mechanism behind fast context-shift on
 `--context-shift`, unused here, and multi-turn prompt reuse in general).
 
-### Prompt cache (`--cache-ram`): sized for this repo's actual workload, not minimized
+### Prompt cache (`--cache-ram`): sized per-deployment for actual working set, not minimized
 
 **`--cache-ram`** (llama-server default: `8192` MiB) caps the prompt
 cache - the set of idle conversation branches kept ready to resume without
 reprocessing (`--cache-idle-slots`, default enabled). This repo briefly
-shipped `LLAMA_CACHE_RAM=1024` under the assumption that shrinking it was
-a pure memory-stability win with no other cost. It wasn't: with agentic
-coding workflows here running subagents sequentially (single slot,
-`--parallel 1`, required by `--spec-type draft-mtp`) and handing control
-back to an orchestrator, each orchestrator<->subagent branch needs to stay
-cached across the handoff to avoid a full reprocess. At 1024 MiB the cache
-couldn't hold both branches at once, and every handoff evicted one to make
-room for the other - turning a few-second cache hit into a 90+ second full
-reprocess of tens of thousands of tokens. Confirmed in this server's own
-logs: the rate of full (>10k token) reprocesses roughly doubled (6.65% of
-requests -> 12.5%) after the cut, at matched request throughput.
+shipped `LLAMA_CACHE_RAM=1024` on all three deployments under the
+assumption that shrinking it was a pure memory-stability win with no other
+cost. It wasn't: with agentic coding workflows here running subagents
+sequentially (single slot, `--parallel 1`, required by `--spec-type
+draft-mtp`) and handing control back to an orchestrator, each
+orchestrator<->subagent branch needs to stay cached across the handoff to
+avoid a full reprocess. At 1024 MiB the cache couldn't hold both branches
+at once, and every handoff evicted one to make room for the other -
+turning a few-second cache hit into a 90+ second full reprocess of tens of
+thousands of tokens. Confirmed in this server's own logs: the rate of full
+(>10k token) reprocesses roughly doubled (6.65% of requests -> 12.5%)
+after the cut, at matched request throughput.
 
 The right number comes from what a single branch actually costs, computed
 from this GGUF's own architecture metadata (`qwen35moe`, read directly from
@@ -379,14 +380,24 @@ block-scale overhead), that's:
 
 ```
 1024 elements/token/layer x 1.0625 bytes x ~10-11 layers  ~=  11 KiB/token
-262,144 tokens (this repo's max ctx) x 11 KiB/token       ~=  2.75 GiB/branch
+262,144 tokens (full-256k's max ctx) x 11 KiB/token       ~=  2.75 GiB/branch
+131,072 tokens (full-128k/limited's max ctx) x 11 KiB/token ~= 1.4 GiB/branch
 ```
 
-`LLAMA_CACHE_RAM=8192` (llama-server's own default, restored rather than
-overridden) covers roughly **3 max-context branches resident at once** -
-orchestrator + active subagent + slack - which is why the upstream default
-turned out to already be a reasonable number for this shape of workload
-rather than something arbitrary to cut down.
+That per-branch cost is *why the value now differs by deployment* rather
+than being one number for all three:
+
+| Deployment | `--cache-ram` | Branches covered | Rationale |
+|---|---:|---|---|
+| `full-128k` | `8192` MiB | ~5-6 max-128k branches | llama-server's own default, restored rather than overridden - daily driver, generous cache |
+| `full-256k` | `8192` MiB | ~3 max-256k branches | same default - orchestrator + active subagent + slack at the larger context size |
+| `limited` | `3072` MiB | ~2 max-128k branches | deliberately smaller: this profile is *only* ever run at 128k context with strictly sequential (never parallel) agents, so exactly 2 branches (orchestrator + one active subagent) is the real ceiling of what it needs - see `limited.env`'s own comments |
+
+`limited` is the profile explicitly meant to share RAM/VRAM with a desktop
+session (see its description throughout this README), so giving back the
+RAM a bigger cache would have reserved - rather than provisioning it for
+branch counts or context sizes it never actually uses - is the point, not
+a compromise.
 
 ### Baseline footprint (not fixed by either flag above)
 
@@ -408,13 +419,44 @@ every `systemd/*.service` unit sets `MemoryHigh=`/`MemoryMax=` (cgroup
 memory caps, so a runaway gets killed and restarted by systemd instead of
 triggering the system-wide OOM killer) and `OOMScoreAdjust=500` (makes the
 kernel prefer killing this process over your desktop apps in a system-wide
-OOM, as a last resort). The specific numbers in each unit are sized for
-baseline-footprint-plus-up-to-8GB-cache, not measured for every profile -
-watch `systemctl --user status llama-server-<profile>`'s peak memory
-column after real use and adjust if it's consistently far from (or
-dangerously close to) the ceiling. Raising `--cache-ram` further than 8192
-without also raising these caps to match will make the cap the thing that
-kills the server under heavy multi-branch use, not a leak.
+OOM, as a last resort). Each unit's ceiling is sized for that deployment's
+own baseline-footprint-plus-worst-case-cache (see the table above for what
+each one's cache budget actually is), not one shared number:
+
+| Deployment | `MemoryHigh` | `MemoryMax` | Notes |
+|---|---:|---:|---|
+| `full-128k` | `28G` | `30G` | raised after `full-128k`'s original 26G/28G (matching `limited`'s at the time) turned out to throttle real usage at `cache-ram=8192` - see below |
+| `full-256k` | `29G` | `30G` | only a small bump (not the same +2G as full-128k): total system RAM is 31Gi, and going further would leave `MemoryMax` so close to total that the cgroup could never actually reach it before the whole system hit global exhaustion first - the cap would stop meaning anything |
+| `limited` | `25G` | `27G` | *lowered* from full-128k/256k's ceiling to match its smaller `cache-ram=3072` - this profile gives RAM back to the desktop rather than reserving headroom it doesn't need |
+
+That "throttle at cache-ram=8192" finding came from
+`cat /sys/fs/cgroup/.../llama-server-<profile>.service/memory.events` -
+its `high` counter (times the cgroup hit `MemoryHigh` and was throttled/
+forced to reclaim, distinct from `oom`/`max`, which never fired) had
+climbed into the thousands within a couple of hours of normal use, with
+the cgroup pushed into a few GB of (fast, zram-backed) swap as a result.
+Not a crash - `MemoryMax` never triggered - but real, frequent throttling
+purely from `cache-ram=8192` needing more headroom than the original
+ceiling gave it, not from a leak. Watch `systemctl --user status
+llama-server-<profile>`'s peak memory column (and `memory.events` for the
+`high` count) after real use and adjust if a profile is consistently
+throttling or, conversely, sitting far below its ceiling. Raising
+`--cache-ram` on any deployment without raising its caps to match will
+make the cap the thing that throttles/kills the server, not a leak.
+
+**A methodological trap worth knowing about, hit while tuning `limited`'s
+first pass at these numbers:** `MemoryHigh` doesn't just cap growth, it
+actively *reclaims* to hold usage at/below the threshold - so a cgroup
+sitting exactly at its `MemoryHigh` value, flat, even under a test
+generation, is not proof that's the real resting footprint. It can equally
+mean the ceiling is too tight and constantly fighting the process back
+down to it. The only way to tell the difference: check `memory.events`'
+`high` counter (climbing fast = being throttled, not settling) or, more
+directly, temporarily raise the ceiling and see where it actually comes to
+rest on its own. `limited` briefly shipped `MemoryHigh=22G` that looked
+"confirmed flat" at exactly 22.0GiB - `high` events were climbing into the
+tens of thousands within 2 minutes at idle. Raised to 25G, it settled on
+its own at ~17-18GiB with zero throttling.
 
 ## Tuning for different hardware
 
