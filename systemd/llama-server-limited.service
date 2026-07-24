@@ -14,6 +14,20 @@ ExecStart=%h/llama-server/scripts/llm-server.sh --tunables-file %h/.config/llama
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
+# Safety net for a desktop box also used for browsing: cap this cgroup so a
+# runaway (this model's context-checkpoint bug or anything else) gets killed
+# and restarted by systemd instead of taking down the whole session via the
+# system-wide OOM killer. Observed baseline for this profile is ~24G RSS at
+# idle right after model load (see README's "Memory stability" section) -
+# these numbers give some growth headroom above that; watch
+# `systemctl --user status llama-server-limited` peak memory and tighten
+# (or loosen) if it's consistently far from the ceiling.
+MemoryHigh=25G
+MemoryMax=27G
+# Prefer the kernel kill *this* process over other apps in a system-wide OOM,
+# since it's expendable (Restart=on-failure brings it back) and your desktop
+# session isn't.
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=default.target

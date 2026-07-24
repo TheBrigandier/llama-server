@@ -51,6 +51,12 @@ Options (each has a matching LLAMA_* environment variable, see below):
                               when --spec-type is draft-mtp, per model card)
   --cache-type-k TYPE       KV cache quantization for K (default: q8_0)
   --cache-type-v TYPE       KV cache quantization for V (default: q8_0)
+  --cache-ram N              Max prompt-cache size in MiB, -1 no limit, 0 disable
+                                (default: 8192 - llama-server's own default)
+  --ctx-checkpoints N        Max context checkpoints per slot (default: 32 -
+                                llama-server's own default; see README's Memory
+                                stability section for why hybrid/recurrent
+                                models like this one should usually set 0)
   --spec-type TYPE          Speculative decoding type (default: draft-mtp)
   --spec-draft-n-max N      Max speculative draft tokens (default: 4 - tuned
                               by testing; accept rate falls off sharply at 5)
@@ -76,7 +82,8 @@ Options (each has a matching LLAMA_* environment variable, see below):
 
 Environment variables (all optional, CLI flags win if both are set):
   LLAMA_MODEL_PATH, LLAMA_NGL, LLAMA_NCMOE, LLAMA_THREADS, LLAMA_CTX_SIZE,
-  LLAMA_PARALLEL, LLAMA_CACHE_TYPE_K, LLAMA_CACHE_TYPE_V, LLAMA_SPEC_TYPE,
+  LLAMA_PARALLEL, LLAMA_CACHE_TYPE_K, LLAMA_CACHE_TYPE_V, LLAMA_CACHE_RAM,
+  LLAMA_CTX_CHECKPOINTS, LLAMA_SPEC_TYPE,
   LLAMA_SPEC_DRAFT_N_MAX, LLAMA_TEMP, LLAMA_TOP_P, LLAMA_TOP_K,
   LLAMA_PRESENCE_PENALTY, LLAMA_HOST, LLAMA_PORT, LLAMA_API_KEY,
   LLAMA_NO_MMAP (1/0), LLAMA_FLASH_ATTN, LLAMA_SERVER_BIN,
@@ -177,6 +184,11 @@ CTX_SIZE="${LLAMA_CTX_SIZE:-131072}"
 PARALLEL="${LLAMA_PARALLEL:-1}"
 CACHE_TYPE_K="${LLAMA_CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${LLAMA_CACHE_TYPE_V:-q8_0}"
+# These two match llama-server's own built-in defaults, not this repo's
+# recommended values - see README's Memory stability section for why the
+# deployment tunables files override both.
+CACHE_RAM="${LLAMA_CACHE_RAM:-8192}"
+CTX_CHECKPOINTS="${LLAMA_CTX_CHECKPOINTS:-32}"
 SPEC_TYPE="${LLAMA_SPEC_TYPE:-draft-mtp}"
 # 4 was chosen by testing on this model/hardware: good speedup at 4, accept
 # rate falls off sharply at 5. The model card's own example uses 2 - that's
@@ -208,6 +220,8 @@ while [[ $# -gt 0 ]]; do
     --parallel) PARALLEL="$2"; shift 2 ;;
     --cache-type-k) CACHE_TYPE_K="$2"; shift 2 ;;
     --cache-type-v) CACHE_TYPE_V="$2"; shift 2 ;;
+    --cache-ram) CACHE_RAM="$2"; shift 2 ;;
+    --ctx-checkpoints) CTX_CHECKPOINTS="$2"; shift 2 ;;
     --spec-type) SPEC_TYPE="$2"; shift 2 ;;
     --spec-draft-n-max) SPEC_DRAFT_N_MAX="$2"; shift 2 ;;
     --temp) TEMP="$2"; shift 2 ;;
@@ -282,6 +296,7 @@ cmd=("$SERVER_BIN"
 [[ "$NO_MMAP" -eq 1 ]] && cmd+=(--no-mmap)
 cmd+=(--flash-attn "$FLASH_ATTN")
 cmd+=(--cache-type-k "$CACHE_TYPE_K" --cache-type-v "$CACHE_TYPE_V")
+cmd+=(--cache-ram "$CACHE_RAM" --ctx-checkpoints "$CTX_CHECKPOINTS")
 cmd+=(--spec-type "$SPEC_TYPE" --spec-draft-n-max "$SPEC_DRAFT_N_MAX")
 cmd+=(--temp "$TEMP" --top-p "$TOP_P" --top-k "$TOP_K" --presence-penalty "$PRESENCE_PENALTY")
 cmd+=(--jinja)

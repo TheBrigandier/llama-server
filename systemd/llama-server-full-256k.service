@@ -14,6 +14,21 @@ ExecStart=%h/llama-server/scripts/llm-server.sh --tunables-file %h/.config/llama
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
+# Safety net for a desktop box also used for browsing: cap this cgroup so a
+# runaway (this model's context-checkpoint bug or anything else) gets killed
+# and restarted by systemd instead of taking down the whole session via the
+# system-wide OOM killer. This profile's 262144 ctx means a bigger baseline
+# KV footprint than full-128k/limited (not directly measured) - these are
+# starting-point estimates and leave less desktop headroom by design, since
+# this deployment is meant for occasional use, not as the daily driver.
+# Watch `systemctl --user status llama-server-full-256k` peak memory and
+# adjust.
+MemoryHigh=27G
+MemoryMax=29G
+# Prefer the kernel kill *this* process over other apps in a system-wide OOM,
+# since it's expendable (Restart=on-failure brings it back) and your desktop
+# session isn't.
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=default.target

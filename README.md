@@ -277,6 +277,57 @@ no-desktop session), enable lingering once:
 loginctl enable-linger "$USER"
 ```
 
+## Memory stability
+
+On a desktop box also used for browsing, an unbounded `llama-server` is a
+real problem, not just an inefficiency - it can eat enough RAM to force
+swapping or trigger the system-wide OOM killer, which can take down
+anything (browser tabs, the desktop session) rather than just the server.
+Two llama-server mechanisms drive that growth here, and both are overridden
+away from llama-server's own defaults in every `config/*.env.example`:
+
+- **`--ctx-checkpoints`** (llama-server default: `32` per slot) saves
+  snapshots of KV/recurrent state so a request can rewind instead of
+  reprocessing from scratch. On this model's hybrid linear-attention/
+  gated-attention (Gated DeltaNet-style) architecture, checkpoints are
+  currently **known-broken upstream**: they get created (consuming RAM) but
+  are constantly invalidated and never successfully restored - see
+  [ggml-org/llama.cpp#24055](https://github.com/ggml-org/llama.cpp/issues/24055)
+  and [#19794](https://github.com/ggml-org/llama.cpp/issues/19794), both
+  filed against this exact model family. Until that's fixed upstream, this
+  repo sets `LLAMA_CTX_CHECKPOINTS=0` - pure memory overhead with no
+  restore benefit for this model as things stand. If a future llama.cpp
+  release fixes hybrid/recurrent checkpoint restore, it's worth
+  re-enabling (checkpoints are the mechanism behind fast multi-turn
+  prompt reuse) and re-testing.
+- **`--cache-ram`** (llama-server default: `8192` MiB) caps the prompt
+  cache, and normal multi-turn usage genuinely fills it - `journalctl
+  --user -u llama-server-<profile>` will show repeated `making room for
+  prompt cache entry, removing oldest entry` lines as it evicts to stay
+  under the cap. An 8GB cache on top of this model's baseline footprint
+  (which alone runs ~24GB+ on a 32GB box, see below) leaves no headroom for
+  the desktop session, so this repo sets `LLAMA_CACHE_RAM=1024`.
+
+Even with both fixed, the model's baseline footprint alone is substantial:
+the `limited` deployment was observed at ~24GB RSS at idle right after
+model load on a 31GB-RAM machine, before any conversation activity. That's
+inherent to running a 22GB+ GGUF with several MoE layers CPU-resident
+(`-ncmoe`), not something these two flags can fix - if you need more
+desktop headroom than that leaves, the lever is raising `-ncmoe` further
+(more VRAM used, more speed given up) or, if you're on a bigger card,
+lowering `-ncmoe` isn't the direction that helps here since it *reduces*
+CPU RAM in favor of VRAM.
+
+As a second layer of protection independent of getting the above tuning
+right, every `systemd/*.service` unit sets `MemoryHigh=`/`MemoryMax=`
+(cgroup memory caps, so a runaway gets killed and restarted by systemd
+instead of triggering the system-wide OOM killer) and `OOMScoreAdjust=500`
+(makes the kernel prefer killing this process over your desktop apps in a
+system-wide OOM, as a last resort). The specific numbers in each unit are
+starting points, not measured for every profile - watch `systemctl --user
+status llama-server-<profile>`'s peak memory column after real use and
+adjust if it's consistently far from (or dangerously close to) the ceiling.
+
 ## Tuning for different hardware
 
 If you're adapting this for a different GPU/RAM combination, the two knobs

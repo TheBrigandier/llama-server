@@ -42,6 +42,17 @@ only the relevant `.env` file.
   value of `2` - this was tuned by testing on this model/hardware (good
   speedup at 4, accept rate falls off sharply at 5). Don't "fix" it back to
   match the card without new evidence.
+- **`LLAMA_CTX_CHECKPOINTS=0` / `LLAMA_CACHE_RAM=1024` are set in every
+  `config/*.env.example`**, overriding llama-server's own defaults (`32`
+  and `8192` respectively) - don't "fix" these back without new evidence.
+  This is a memory-stability workaround for two things: (1) context
+  checkpoints are known-broken upstream on this model's hybrid/recurrent
+  architecture (created but never successfully restored - see README's
+  "Memory stability" section and the linked llama.cpp issues), so they're
+  pure RAM overhead right now; (2) the 8192 MiB default cache-ram leaves no
+  headroom on a 32GB desktop box that's also used for browsing. If an
+  upstream fix lands for (1), re-enabling checkpoints and re-testing is
+  reasonable - don't just revert silently.
 - **Sampling defaults** (`temp=1.0, top_p=0.95, top_k=20,
   presence_penalty=1.5`) are always applied unless overridden - they come
   from the model card's "thinking mode" recommendation, not llama.cpp's

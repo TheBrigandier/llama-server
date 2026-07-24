@@ -16,6 +16,19 @@ Restart=on-failure
 RestartSec=5
 # Model load (22GB, --no-mmap) plus KV cache allocation can take a while.
 TimeoutStartSec=300
+# Safety net for a desktop box also used for browsing: cap this cgroup so a
+# runaway (this model's context-checkpoint bug or anything else) gets killed
+# and restarted by systemd instead of taking down the whole session via the
+# system-wide OOM killer. Unlike llama-server-limited.service, this
+# profile's baseline RAM hasn't been directly measured (fewer ncmoe layers
+# stay on CPU here) - these are starting-point estimates, watch
+# `systemctl --user status llama-server-full-128k` peak memory and adjust.
+MemoryHigh=23G
+MemoryMax=25G
+# Prefer the kernel kill *this* process over other apps in a system-wide OOM,
+# since it's expendable (Restart=on-failure brings it back) and your desktop
+# session isn't.
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=default.target
