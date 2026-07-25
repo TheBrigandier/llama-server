@@ -67,11 +67,13 @@ only the relevant `.env` file.
 - **`LLAMA_CACHE_RAM` is set explicitly in every `config/*.env.example`, but
   is NOT the same value across all three** - don't "consolidate" it back to
   one number. `full-128k`/`full-256k` use `8192` (llama-server's own
-  default, matching rather than overriding it down). `limited` uses `3072`
-  - deliberately smaller, because that profile is only ever run at 128k
-  context with strictly sequential (never parallel) agents, so it only
-  ever needs ~2 resident branches (orchestrator + one active subagent)
-  where the other two profiles are provisioned for ~3+. This repo briefly
+  default, matching rather than overriding it down). `limited` uses `3072`,
+  smaller because its `MemoryMax` is tighter - **not** because it only ever
+  needs 2 branches. That older rationale was measured wrong on 2026-07-25: 3
+  branches x 34k tokens needed 2550 MiB, leaving `3072` only ~500 MiB spare,
+  and real sessions here run 43-52k-token branches (~1.1 GiB each). See the
+  cap-not-a-reservation bullet below before touching any of these. This repo
+  briefly
   shipped `1024` on all three under the assumption that shrinking it was a
   free memory-stability win - it wasn't: this repo's sequential-subagent
   workflow needs the orchestrator's branch and the active subagent's
@@ -110,18 +112,16 @@ only the relevant `.env` file.
   not bound total memory - the active slot and its checkpoints sit outside the
   prompt cache. Size it to the working set and let `MemoryMax` be the guard.
 - **systemd `MemoryHigh`/`MemoryMax` differ per deployment and aren't
-  arbitrary either** - `full-128k` (28G/30G) and `full-256k` (29G/30G) are
-  sized for baseline + up to their 8192 MiB cache; `limited` (25G/27G) is
-  *lower*, matching its smaller 3072 MiB cache so that RAM goes back to the
-  desktop instead of sitting reserved. `full-256k`'s bump is smaller than
-  `full-128k`'s on purpose: total system RAM is 31Gi, and pushing
-  `MemoryMax` much higher would leave so little floor that the cgroup could
-  never actually hit its own cap before the whole system hit global memory
-  exhaustion first - don't push any of these caps to within ~1Gi of total
-  system RAM. See README's "Memory stability" section for the
-  `memory.events` `high`-counter evidence that motivated raising
-  `full-128k`/`full-256k` in the first place (throttling from
-  `cache-ram=8192` needing more headroom, not an actual leak).
+  arbitrary either** - `full-128k` (28G/30G) and `full-256k` (29G/30G) stay
+  high because they only run under `multi-user.target` with no desktop
+  competing. `limited` is **21G/23G**, sized from measurement (resting
+  16.24 GB, worst case 18.74 GB at `ncmoe=33`) to leave ~8GB of the 31Gi box
+  for the desktop; its previous 25G/27G left only ~4GB and caused
+  system-wide allocation failures. Verified free: prefill is identical under
+  both. Don't push any cap to within ~1Gi of total system RAM, and don't
+  raise `limited`'s without re-measuring - `ncmoe` changes move weight
+  between VRAM and host RAM, so the footprint these are sized against is
+  tied to that value.
 - **Don't trust a cgroup sitting flat at exactly its own `MemoryHigh` value
   as proof that's the real resting footprint** - `MemoryHigh` actively
   reclaims to hold usage at/below itself, so a process pinned there (even
@@ -131,8 +131,14 @@ only the relevant `.env` file.
   or temporarily raise the ceiling and see where it actually rests. This is
   exactly how `limited`'s `MemoryHigh` first got set to `22G` (looked
   "confirmed flat" at 22.0GiB, `high` events were climbing into the tens of
-  thousands within 2 minutes at idle) before being corrected to `25G`,
-  where it settled on its own at ~17-18GiB with zero throttling.
+  thousands within 2 minutes at idle) before being corrected upward.
+  The converse also holds, though: a climbing `high` counter is **not** by
+  itself proof a ceiling is too tight. Most of `memory.current` here is page
+  cache from reading a 22GB GGUF under `--no-mmap`, which reclaims for free.
+  At `limited`'s current 21G/23G the counter runs into the tens of thousands
+  while prefill throughput is measurably identical to the old looser caps.
+  Judge by `anon`+`shmem`, `memory.swap.current` and `oom_kill`, not by
+  `high`.
 - **Sampling defaults** (`temp=1.0, top_p=0.95, top_k=20,
   presence_penalty=1.5`) are always applied unless overridden - they come
   from the model card's "thinking mode" recommendation, not llama.cpp's

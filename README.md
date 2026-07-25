@@ -222,15 +222,26 @@ non-standard OpenAI fields with varying (and sometimes broken) reliability.
 `opencode.json`, for two reasons specific to how Claude Code works rather
 than any limitation of this server:
 
-- **No sampling profiles.** Claude Code's `settings.json` schema has no
-  field for `temperature`/`top_p`/`top_k`/etc - it doesn't let the client
-  override sampling at all. That's fine here: this repo's tunables files
-  already bake the model card's "thinking mode" sampling defaults
-  (`temp=1.0 top_p=0.95 top_k=20 presence_penalty=1.5`, see [Sampling &
-  MTP notes](#sampling--mtp-notes)) into the server itself, so whatever
-  Claude Code sends (or doesn't send), the right values apply
-  server-side. This is the opposite direction from `opencode.json`, whose
-  profiles exist precisely to inject those same values client-side.
+- **No sampling profiles - because there is nowhere to put them.** Claude
+  Code's `settings.json` schema has no field for
+  `temperature`/`top_p`/`top_k`/etc, so unlike `opencode.json` there is no
+  way to *configure* sampling on the client side at all.
+
+  This is a gap, not a feature, and it does **not** mean the server's values
+  always win. Measured against this server's Anthropic endpoint: a request
+  with no sampling fields correctly picked up the CLI defaults
+  (`temp=1.0 top_p=0.95 presence_penalty=1.5`), but a request carrying
+  `temperature: 0.123, top_p: 0.404` applied exactly those instead. Whatever
+  Claude Code puts in its own request bodies overrides the flags in
+  [Sampling & MTP notes](#sampling--mtp-notes), for every field it sends -
+  the same behaviour documented there for OpenCode. Fields it omits (e.g.
+  `presence_penalty` in that test) do fall through to the server.
+
+  So the practical position is: the tunables files set a sensible floor,
+  Claude Code may silently override part of it, and there is no config knob
+  to correct that. Check what actually applied with `/slots` during a real
+  Claude Code request rather than assuming - `/props` only shows the
+  server's own CLI-baked baseline.
 - **No 128k/256k split.** Unlike OpenCode's `limit.context`, Claude Code's
   config has no client-side context-size field to keep in sync with
   whichever deployment (see
@@ -697,8 +708,18 @@ down to it. The only way to tell the difference: check `memory.events`'
 directly, temporarily raise the ceiling and see where it actually comes to
 rest on its own. `limited` briefly shipped `MemoryHigh=22G` that looked
 "confirmed flat" at exactly 22.0GiB - `high` events were climbing into the
-tens of thousands within 2 minutes at idle. Raised to 25G, it settled on
-its own at ~17-18GiB with zero throttling.
+tens of thousands within 2 minutes at idle. Raised, it settled on its own
+at ~17-18GiB with zero throttling.
+
+**The converse trap is just as real, and this repo fell into it next:** a
+climbing `high` counter is *not* by itself proof the ceiling is too tight.
+Most of `memory.current` here is page cache from reading a 22GB GGUF under
+`--no-mmap`, and reclaiming that is free. `limited` now runs at 21G/23G
+with the `high` counter in the tens of thousands and *measurably identical*
+prefill throughput to the looser 25G/27G it replaced (46.1/45.7/45.2s vs
+46.0/45.5/44.9s, controlled A/B). Distinguish the two cases by what is
+actually being reclaimed: check `anon`+`shmem` against the cap, plus
+`memory.swap.current` and `oom_kill`, not the `high` count alone.
 
 ## Tuning for different hardware
 
