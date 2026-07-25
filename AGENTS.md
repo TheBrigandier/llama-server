@@ -250,7 +250,13 @@ example-configs/<agent>/    committed client configs for coding agents that talk
 
 `example-configs/<agent-name>/` holds committed, ready-to-use client
 configs for coding agents that talk to this server. `opencode/opencode.json`
-is the reference example - follow its pattern for any new agent:
+is the reference example for OpenAI-compatible clients;
+`claude-code/settings.json` is the reference example for Claude Code, which
+talks to llama-server's Anthropic Messages API instead and has a narrower
+config surface (no client-side sampling overrides, no client-side context
+limit - see README's "Coding agent configs" section for why its config is
+structurally simpler than OpenCode's, not just shorter). Follow whichever
+is the closer match for any new agent:
 
 - **Sampling values come from the model card's published presets, not
   guesswork.** The card documents four: Thinking-general, Thinking-precise-coding,
