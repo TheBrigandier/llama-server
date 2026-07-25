@@ -147,15 +147,20 @@ without starting it.
 
 ```
 example-configs/
-└── opencode/
-    └── opencode.json   # OpenCode provider config for this server
+├── opencode/
+│   └── opencode.json    # OpenCode provider config (OpenAI-compatible API)
+└── claude-code/
+    └── settings.json     # Claude Code config (Anthropic Messages API)
 ```
 
 `example-configs/<agent-name>/` holds ready-to-use client configs for
-coding agents that talk to this server over its OpenAI-compatible API
-(`http://localhost:8080/v1`). Currently just [OpenCode](https://opencode.ai/),
-but the same pattern is meant to extend to other agents (Claude Code,
-Continue, etc.) as they're set up against this server - each gets its own
+coding agents that talk to this server. OpenCode uses the server's
+OpenAI-compatible API (`http://localhost:8080/v1`); Claude Code uses
+llama-server's newer built-in [Anthropic Messages
+API](https://huggingface.co/blog/ggml-org/anthropic-messages-api-in-llamacpp)
+(`http://localhost:8080`, no `/v1` suffix - Claude Code's `ANTHROPIC_BASE_URL`
+appends its own path). The same pattern is meant to extend to other agents
+(Continue, etc.) as they're set up against this server - each gets its own
 subdirectory here rather than scattering config in unrelated places.
 
 `opencode/opencode.json` defines **10 model profiles**: 5 sampling
@@ -184,7 +189,39 @@ silently ignoring. Any future agent config added here should get the same
 treatment before being trusted, since different clients pass through
 non-standard OpenAI fields with varying (and sometimes broken) reliability.
 
-**`apiKey` must stay a placeholder in every file here** (currently
+`claude-code/settings.json` is deliberately much simpler than
+`opencode.json`, for two reasons specific to how Claude Code works rather
+than any limitation of this server:
+
+- **No sampling profiles.** Claude Code's `settings.json` schema has no
+  field for `temperature`/`top_p`/`top_k`/etc - it doesn't let the client
+  override sampling at all. That's fine here: this repo's tunables files
+  already bake the model card's "thinking mode" sampling defaults
+  (`temp=1.0 top_p=0.95 top_k=20 presence_penalty=1.5`, see [Sampling &
+  MTP notes](#sampling--mtp-notes)) into the server itself, so whatever
+  Claude Code sends (or doesn't send), the right values apply
+  server-side. This is the opposite direction from `opencode.json`, whose
+  profiles exist precisely to inject those same values client-side.
+- **No 128k/256k split.** Unlike OpenCode's `limit.context`, Claude Code's
+  config has no client-side context-size field to keep in sync with
+  whichever deployment (see
+  [Deployments](#deployments-tunables-files)) is running - it just sends
+  requests and the server enforces its own loaded context. One file
+  covers every deployment.
+
+`ANTHROPIC_MODEL`/`ANTHROPIC_DEFAULT_OPUS_MODEL`/`ANTHROPIC_DEFAULT_SONNET_MODEL`/
+`ANTHROPIC_DEFAULT_HAIKU_MODEL`/`ANTHROPIC_SMALL_FAST_MODEL` are all pointed
+at the same placeholder model name because llama-server only ever has one
+model loaded at a time and doesn't validate the `model` field against
+anything - Claude Code's opus/sonnet/haiku tiering doesn't map to
+anything meaningful on a single local model, so every tier is just routed
+at the one model that's actually running.
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`/`DISABLE_TELEMETRY`/`DISABLE_ERROR_REPORTING`/`DISABLE_AUTOUPDATER`
+are set because this is a fully local, offline setup - there's no reason
+for Claude Code to phone home to Anthropic's own infrastructure for
+anything other than the actual (locally-redirected) inference requests.
+
+**`apiKey`/`ANTHROPIC_AUTH_TOKEN` must stay a placeholder in every file here** (currently
 `"CHANGE-ME"`) - these configs are meant to be safe to commit. Supply the
 real key through whatever secret-injection mechanism the agent supports
 (e.g. OpenCode's `{env:VAR_NAME}` config substitution) or a local,
