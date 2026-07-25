@@ -85,11 +85,40 @@ MemoryMax=30G
 # competing for RAM. Don't copy these numbers to a profile that runs on
 # graphical.target.
 #
-# NOT YET VALIDATED against a near-full context: this profile cannot be
-# started from a graphical session, so the near-full-131072 measurement that
-# re-sized `limited` has not been repeated here. `limited`'s ceilings proved
-# wrong by ~2.5GiB when sized from a synthetic test - treat these as
-# provisional and re-measure under multi-user.target before trusting them.
+# VALIDATED 2026-07-25 under multi-user.target, near-full 262144 context
+# (250,098 tokens in one conversation, then a second branch layered on top):
+#
+#   resting unreclaimable (anon+shmem)     16.05 GiB
+#   peak unreclaimable, cache-ram=8192     22.22 GiB
+#   min system-available RAM                6887 MiB
+#   memory.events    high 0, max 0, oom_kill 0
+#   prefill                    250,098 tok / 390s  (~510 tok/s, no falloff)
+#   branch restore   250,099 tok -> reproc=250099, 384.62s  <- NOT cached
+#
+# That 22.22 GiB is NOT the worst case. It is low precisely *because* the
+# 250k branch was rejected by the cache (8,977 MiB entry vs an 8192 MiB
+# limit), leaving the cache nearly empty. The real worst case is a full
+# cache: measured at ~26 GiB when the entry did fit (see below). Size
+# against ~26 GiB, not 22.22.
+#
+# DO NOT raise --cache-ram on a 32GB host to fix the uncached branch. Tested
+# directly at cache-ram=10240: the cgroup wedged in direct reclaim - peak
+# 26.67 GiB unreclaimable, memory.swap.current pinned at its 4G bound, 166k
+# `high` events, oom_kill still 0, system-available RAM down to 141 MiB.
+# Process state D in mem_cgroup_handle_over_high. That is the same
+# deadlock described above, reproduced on demand; recovered with
+# `systemctl --user stop` (no reboot). A 262144 branch simply cannot be held
+# in cache while its slot is live on 31.25 GiB of RAM.
+#
+# MemoryMax=30G on a 31.25 GiB box cannot actually fire before global
+# exhaustion - it is not a working safety net here. It is left at 30G anyway
+# because the profile is self-limiting: cache-ram=8192 caps the worst case
+# near ~26 GiB. Tightening MemoryMax enough to make it fire would put
+# MemoryHigh within ~1 GiB of that worst case, which is exactly the
+# over-tightening that caused the 8-hour deadlock. cache-ram, not MemoryMax,
+# is the real bound on this hardware.
+#
+# Re-tune on a larger-RAM host: see README's "Tuning for different hardware".
 MemorySwapMax=4G
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop

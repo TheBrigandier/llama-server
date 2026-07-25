@@ -16,6 +16,14 @@ nohup.out
 core
 core.*
 
+# testing/ outputs - measurement results are per-machine and reproducible,
+# the apparatus that produces them is what's committed. (*.log above already
+# covers memsample-*/ctxfill-* logs.)
+testing/peaks-*.txt
+testing/run-*.out
+__pycache__/
+*.pyc
+
 # editor/OS cruft
 *.swp
 *.swo

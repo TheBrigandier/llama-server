@@ -80,11 +80,28 @@ MemoryMax=30G
 # competing for RAM. Don't copy these numbers to a profile that runs on
 # graphical.target.
 #
-# NOT YET VALIDATED against a near-full context: this profile cannot be
-# started from a graphical session, so the near-full-131072 measurement that
-# re-sized `limited` has not been repeated here. `limited`'s ceilings proved
-# wrong by ~2.5GiB when sized from a synthetic test - treat these as
-# provisional and re-measure under multi-user.target before trusting them.
+# VALIDATED 2026-07-25 under multi-user.target, near-full 131072 context
+# (125,701 tokens in one conversation, then a second branch layered on top -
+# the same shape that re-sized `limited`):
+#
+#   resting unreclaimable (anon+shmem)     13.52 GiB
+#   PEAK unreclaimable                     19.38 GiB
+#   peak memory.current                    25.50 GiB  (mostly page cache)
+#   min system-available RAM                9817 MiB
+#   memory.events    high 0, max 0, oom_kill 0  <- never throttled at all
+#   memory.swap.current                     0.00 GiB
+#   prefill                    125,701 tok / 151s  (`limited`: ~193s)
+#   branch restore    125,702 tok -> reproc=5, 0.24s   <- cache working
+#
+# Measured with the caps temporarily raised to 30G/31G so the peak could not
+# be clipped by the very limits being derived. 19.38 GiB peak vs MemoryHigh
+# 28G is ~8.6 GiB of headroom - generous, deliberately left that way: this
+# profile only runs under multi-user.target with no desktop competing, and
+# `--cache-ram=8192` already bounds the working set well below these caps
+# (a full 131072 branch is only ~4.6 GiB as a cache entry). The binding
+# constraint on this box is cache-ram, not these ceilings.
+#
+# Re-measure if `ncmoe` changes - it moves weight between VRAM and host RAM.
 MemorySwapMax=4G
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop

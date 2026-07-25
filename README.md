@@ -47,10 +47,17 @@ rather than trimmed for memory savings.
 │   └── *.gguf                     # model weights (gitignored, see .gitignore)
 ├── scripts/
 │   └── llm-server.sh              # launcher - has one built-in default config
-└── systemd/
-    ├── llama-server-full-128k.service
-    ├── llama-server-full-256k.service
-    └── llama-server-limited.service
+├── systemd/
+│   ├── llama-server-full-128k.service
+│   ├── llama-server-full-256k.service
+│   └── llama-server-limited.service
+└── testing/                       # measurement apparatus - see testing/README.md
+    ├── measure-profile.sh         # end-to-end memory/perf run for one deployment
+    ├── memsample.sh               # cgroup sampler (anon+shmem peak tracking)
+    ├── ctx_fill.py                # near-full context + 2nd branch workload
+    ├── cacheram_test.py           # --cache-ram sizing (3-branch restore hit rate)
+    ├── branch_switch.py           # --ctx-checkpoints sizing (A/B/A switch)
+    └── gguf_meta.py               # GGUF architecture metadata, no model load
 ```
 
 ## Quick start
@@ -411,6 +418,14 @@ size needs to match how this repo is actually used rather than just being
 minimized. Both were previously mis-tuned in the direction of "use less RAM",
 and both cost more time than they saved.
 
+> **Every number in this section is from one specific machine** — RTX 4070
+> (12GB VRAM), 31.25 GiB RAM, `Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL`. Different
+> VRAM, RAM, or quant changes all of them. The tools that produced them are
+> committed in **[`testing/`](testing/)** — see
+> [testing/README.md](testing/README.md) to re-derive these values on your own
+> hardware rather than inheriting mine. Start with
+> `testing/measure-profile.sh`.
+
 ### Context checkpoints: ENABLED - they are what makes the prompt cache work
 
 **`--ctx-checkpoints`** (llama-server default: `32` per slot) saves
@@ -488,41 +503,78 @@ after the cut, at matched request throughput.
 > **Caveat on the numbers in this subsection.** The 1024-vs-8192 comparison
 > above was measured while `--ctx-checkpoints` was `0`, i.e. while branch
 > restore was mostly broken (see the section above). The reprocess rates were
-> really observed, but *why* they moved is now unclear - with checkpoints
+> really observed, but *why* they moved is not established - with checkpoints
 > disabled the cache could rarely restore a branch regardless of its size.
-> The per-branch cost derivation below is from the GGUF's own metadata and is
-> unaffected. Re-validate the sizing itself now that checkpoints are on;
-> cached entries also carry checkpoint state, so a given `--cache-ram` holds
-> somewhat fewer branches than the table implies.
+> Treat that comparison as historical. The sizing **has** since been
+> re-validated with checkpoints on (2026-07-25, all three deployments) and
+> the corrected per-entry cost is below - it is ~3x the old estimate, which
+> is why the deployment table changed.
 
-The right number comes from what a single branch actually costs, computed
-from this GGUF's own architecture metadata (`qwen35moe`, read directly from
-the file - not guessed): `full_attention_interval=4` means only ~10-11 of
-41 layers are full attention (the rest are fixed-size recurrent/SSM state
-that doesn't grow with context at all); those full-attention layers have 2
-KV heads x 256-dim K/V each; at `q8_0` (1.0625 bytes/element after
-block-scale overhead), that's:
+The right number comes from what a single branch actually costs. There are
+two different figures here and conflating them is the mistake this section
+used to make.
+
+**Attention KV alone** is computable from this GGUF's own architecture
+metadata (`qwen35moe`, read directly from the file - not guessed):
+`full_attention_interval=4` means only ~10-11 of 41 layers are full
+attention (the rest are fixed-size recurrent/SSM state that doesn't grow
+with context at all); those full-attention layers have 2 KV heads x 256-dim
+K/V each; at `q8_0` (1.0625 bytes/element after block-scale overhead):
 
 ```
 1024 elements/token/layer x 1.0625 bytes x ~10-11 layers  ~=  11 KiB/token
-262,144 tokens (full-256k's max ctx) x 11 KiB/token       ~=  2.75 GiB/branch
-131,072 tokens (full-128k/limited's max ctx) x 11 KiB/token ~= 1.4 GiB/branch
 ```
 
-That per-branch cost is *why the value now differs by deployment* rather
-than being one number for all three:
+**But a stored cache entry is ~3x that**, because it also carries
+checkpoint and slot state. `--cache-ram` is spent on entries, not on bare
+attention KV, so **~36 KiB/token is the number to size against.** Measured
+three independent ways, all in agreement:
 
-| Deployment | `--cache-ram` | Branches covered | Rationale |
+| branch | entry size | KiB/token |
+|---:|---:|---:|
+| ~88k tok | 2,896 MiB | 33.5 |
+| 125,701 tok | ~4 GiB | ~33 |
+| 250,099 tok | **8,977 MiB** (server-reported) | **35.9** |
+
+The 250k figure is not inferred - llama-server states it outright when the
+entry doesn't fit:
+
+```
+W srv alloc: - prompt state size 8977.270 MiB exceeds cache size limit 8192.000 MiB, skipping
+```
+
+At ~36 KiB/token a max-context branch costs **~4.6 GiB at 131072** and
+**~9.0 GiB at 262144**. That is *why the value differs by deployment*:
+
+| Deployment | `--cache-ram` | Max branch it can hold | Rationale |
 |---|---:|---|---|
-| `full-128k` | `8192` MiB | ~5-6 max-128k branches | llama-server's own default, restored rather than overridden - daily driver, generous cache |
-| `full-256k` | `8192` MiB | ~3 max-256k branches | same default - orchestrator + active subagent + slack at the larger context size |
-| `limited` | `3072` MiB | ~2 max-128k branches | deliberately smaller: this profile is *only* ever run at 128k context with strictly sequential (never parallel) agents, so exactly 2 branches (orchestrator + one active subagent) is the real ceiling of what it needs - see `limited.env`'s own comments |
+| `full-128k` | `8192` MiB | full 131072 branch (~4.6 GiB) **+ a ~97k second branch** | llama-server's own default, restored rather than overridden. Measured: return to a 125,701-tok branch cost `reproc=5` / 0.24s |
+| `full-256k` | `8192` MiB | branches up to **~228k tokens**; a full 262144 branch (~9.0 GiB) **does not fit** | see the ceiling note below - raising this is not possible on 32GB RAM |
+| `limited` | `5120` MiB | exactly one full 131072 branch (~4.6 GiB) | raised from `3072` on 2026-07-25: at 3072 a ~125k branch could not be cached *at all*, so every switch back reprocessed 125,702 tokens / 190.25s. At 5120: 5 tokens / 0.32s |
 
 `limited` is the profile explicitly meant to share RAM/VRAM with a desktop
-session (see its description throughout this README), so giving back the
-RAM a bigger cache would have reserved - rather than provisioning it for
-branch counts or context sizes it never actually uses - is the point, not
-a compromise.
+session (see its description throughout this README), so it is sized to the
+one full branch it actually needs rather than to a branch count it never
+uses.
+
+#### `full-256k`'s ~228k-token cache ceiling (measured 2026-07-25)
+
+`8192` MiB / ~36 KiB per token = **~228,000 tokens**. Above that, a branch
+cannot be stored at all and every switch back to it is a full reprocess -
+measured at 250,099 tokens: `reproc=250099`, **384.62s**.
+
+**This is not fixable by raising `--cache-ram` on a 32GB box.** Storing a
+9 GiB entry while the active slot still holds the same state pushes the
+cgroup past what the machine has. Tested directly at `--cache-ram 10240`:
+peak 26.67 GiB unreclaimable, swap pinned at its 4G bound, 166k `high`
+events, `oom_kill` still 0, and system-available RAM down to **141 MiB** -
+the direct-reclaim deadlock described below, reproduced on demand. It was
+recovered with `systemctl --user stop` (no reboot needed).
+
+So `full-256k` keeps `8192` and accepts the ceiling: caching works normally
+for the ~87% of its context window below ~228k tokens, and the top 13%
+trades a few minutes of reprocess for stability. On a larger-RAM host this
+constraint disappears - see [Tuning for different hardware](#tuning-for-different-hardware).
 
 ### `--cache-reuse`: refused by this model, absent on purpose
 
@@ -738,12 +790,20 @@ at ~17-18GiB with zero throttling.
 **The converse trap is just as real, and this repo fell into it next:** a
 climbing `high` counter is *not* by itself proof the ceiling is too tight.
 Most of `memory.current` here is page cache from reading a 22GB GGUF under
-`--no-mmap`, and reclaiming that is free. `limited` now runs at 21G/23G
-with the `high` counter in the tens of thousands and *measurably identical*
-prefill throughput to the looser 25G/27G it replaced (46.1/45.7/45.2s vs
+`--no-mmap`, and reclaiming that is free. `limited` ran at 21G/23G with the
+`high` counter in the tens of thousands and *measurably identical* prefill
+throughput to the looser 25G/27G it replaced (46.1/45.7/45.2s vs
 46.0/45.5/44.9s, controlled A/B). Distinguish the two cases by what is
 actually being reclaimed: check `anon`+`shmem` against the cap, plus
 `memory.swap.current` and `oom_kill`, not the `high` count alone.
+
+> **`limited` no longer runs at 21G/23G - it runs at 23G/25G.** Those
+> throughput numbers stand, but 21G/23G was still wrong: it was sized from a
+> 3x34k-token synthetic test peaking at 18.74 GiB, and the real worst case
+> (a 125,701-token context plus a second branch) is **20.39-21.16 GiB** -
+> i.e. *above* the 21G `MemoryHigh` it was given. That is what produced the
+> 8-hour direct-reclaim deadlock. The lesson is not "tight caps are free"
+> but "measure against a near-full context, then leave ~4 GiB."
 
 ## Tuning for different hardware
 
@@ -759,3 +819,40 @@ that matter most:
 Watch `nvidia-smi` while the server loads and while under load to see
 actual VRAM usage, and adjust `LLAMA_NCMOE` in the relevant tunables file
 (or pass `--ncmoe` for a one-off run) accordingly.
+
+### If you add host RAM (32GB -> 64GB): what to re-tune, and what not to
+
+Every memory compromise in this repo is a consequence of 31.25 GiB
+specifically. On a 64GB host:
+
+| | 32GB (as shipped) | 64GB |
+|---|---|---|
+| `full-256k` worst case | ~26 GiB of 31.25 - ~5 GiB spare | ~26 GiB of ~62 - ~36 GiB spare |
+| `--cache-ram` to hold two full 262144 branches | needs ~18 GiB - **impossible** | comfortably affordable |
+| a `MemoryMax` that can actually OOM-kill | none exists (30G leaves 1.25 GiB) | e.g. 40G leaves ~22 GiB |
+
+**Worth re-tuning:**
+
+- **`full-256k`'s `--cache-ram`.** Raise past `9216` and the ~228k-token
+  cache ceiling disappears (~18432 holds two full 262144 branches).
+  This is the single biggest win - it removes the 384s full-reprocess.
+- **`MemoryHigh`/`MemoryMax` on all three.** With real slack these can be
+  set to genuinely fire (peak + ~4 GiB) instead of being nominal.
+- **`limited`'s ceilings**, if you still run a desktop alongside - it stops
+  needing to be the RAM-hungriest profile by such a margin.
+
+**Not worth changing - these are not RAM-bound:**
+
+- **`-ncmoe` (27/32/33).** Set by the 12GB VRAM budget, not host RAM. More
+  system RAM does not let you move MoE layers back onto the GPU.
+- **Prefill throughput.** ~510-830 tok/s here is compute-bound. A 250k
+  context still takes ~390s to fill the *first* time; more RAM only avoids
+  *re*processing it.
+- **`--ctx-checkpoints=32`/`8`.** A demand-allocated ceiling, already
+  non-binding.
+- **`MemorySwapMax=4G`.** Still must be bounded and non-zero for the
+  reasons above, at any RAM size.
+
+Re-measure with `measure-profile.sh` after the upgrade rather than scaling
+these numbers by hand - the resting footprints (13.52 / 16.05 / 16.24 GiB)
+won't move, but every ceiling derived from them should.

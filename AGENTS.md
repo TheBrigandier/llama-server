@@ -83,11 +83,13 @@ only the relevant `.env` file.
   MiB couldn't hold both, turning fast handoffs into 90+ second full
   reprocesses (measured: full-reprocess rate roughly doubled at matched
   request throughput). See README's "Memory stability" section for the
-  per-branch cost calculation (derived from this GGUF's own architecture
-  metadata: ~11 KiB/token, ~1.4GiB per max-128k branch, ~2.75GiB per
-  max-256k branch) and the per-deployment table before changing any of
-  these values - they're sized for each deployment's actual branch count,
-  not picked arbitrarily. If you do need to trade cache size for desktop
+  per-branch cost calculation and the per-deployment table before changing
+  any of these values - they're sized for each deployment's actual branch
+  count, not picked arbitrarily. **Note the ~11 KiB/token figure derived
+  from GGUF metadata (~1.4GiB per max-128k branch, ~2.75GiB per max-256k
+  branch) is attention KV only and understates a real cache entry by ~3x** -
+  the measured per-entry cost is ~36 KiB/token, i.e. ~4.6 GiB per max-128k
+  branch and ~9.0 GiB per max-256k branch. Size `--cache-ram` against those. If you do need to trade cache size for desktop
   RAM on `full-128k`/`full-256k`, that's a real tradeoff to make
   deliberately (and adjust the systemd `MemoryHigh`/`MemoryMax` caps to
   match - see the next bullet), not a default to "clean up."
@@ -96,8 +98,27 @@ only the relevant `.env` file.
   (27) or `full-256k` (32), because the GPU is busy serving a desktop. The
   full profiles only run under `multi-user.target`. **Never start a `full-*`
   unit to test something while a desktop session is running** - it will fail
-  to load, and `Conflicts=` will have stopped `limited` on the way. Measure on
-  `limited`.
+  to load, and `Conflicts=` will have stopped `limited` on the way. From a
+  desktop session, measure on `limited`. To measure a `full-*` profile,
+  `sudo systemctl isolate multi-user.target` first and drive it over SSH from
+  another machine (both full profiles were validated this way on 2026-07-25).
+  Verify you are actually there before starting - `systemctl get-default`
+  reports the *default*, not the current target; check
+  `systemctl is-active graphical.target display-manager.service` and
+  `loginctl list-sessions` for a lingering greeter.
+- **`full-256k` cannot cache a near-full branch on a 32GB host, and this is
+  not fixable by raising `--cache-ram`.** A stored cache entry costs
+  **~36 KiB/token** (measured: 8,977 MiB for 250,099 tokens, stated outright
+  by the server - `prompt state size 8977.270 MiB exceeds cache size limit
+  8192.000 MiB, skipping`), *not* the ~11 KiB/token that bare attention KV
+  implies. So `cache-ram=8192` caches branches only up to **~228k tokens**;
+  above that every switch is a full reprocess (measured 250,099 tokens /
+  384.62s). Raising to `10240` was tested and **deadlocked the box**: peak
+  26.67 GiB unreclaimable, swap pinned at its 4G bound, 166k `high` events,
+  `oom_kill` 0, system-available RAM down to 141 MiB, process state `D` in
+  `mem_cgroup_handle_over_high`. This is an accepted, documented limitation -
+  don't "fix" it on this hardware. It disappears on a larger-RAM host; see
+  README's "If you add host RAM" section.
 - **`MemorySwapMax` must be BOUNDED - neither unlimited nor `0`.** Both
   extremes were tried and both failed on this box. Unlimited (the cgroup
   default) defeats `MemoryMax`: swap here is zram (compressed RAM, not disk),
@@ -213,7 +234,30 @@ models/                     gitignored weights, not otherwise touched by tooling
 example-configs/<agent>/    committed client configs for coding agents that talk to this
                             server (e.g. example-configs/opencode/opencode.json) - apiKey
                             fields must stay placeholders, see conventions below
+testing/                    measurement apparatus the tunables were derived from
+                            (measure-profile.sh, ctx_fill.py, cacheram_test.py, ...) -
+                            see testing/README.md. Outputs are gitignored; the tools
+                            are committed so others can re-derive values on their own
+                            hardware. Lived in ~/.config/llama-server/testing/ until
+                            2026-07-25.
 ```
+
+## Conventions when editing `testing/`
+
+- **The values in this repo's docs are per-machine; the method is not.**
+  Anything added here should be written so someone on different hardware can
+  run it and get *their* numbers. Don't hardcode this box's host/port, API
+  key path, RAM sizes, or unit names - the existing scripts take
+  `LLAMA_TEST_HOST`/`LLAMA_TEST_PORT`/`LLAMA_TEST_URL`,
+  `LLAMA_TEST_API_KEY_FILE`/`LLAMA_TEST_API_KEY`, `UNIT`, `CGROUP_PATH`.
+- **Python scripts use the standard library only** and share `_common.py` for
+  endpoint/auth/`report()`. No pip install should ever be needed - these get
+  run on a headless box mid-debugging.
+- **Requests must stay non-streamed.** Only the non-streamed response carries
+  the `timings` block, and `timings.prompt_n` is the entire measurement. A
+  "modernization" to streaming silently destroys every script here.
+- New scripts should print a plain aligned table plus a one-line verdict, and
+  must not require `sys.argv[1]` (use `_common.label()`).
 
 ## Conventions when editing `scripts/llm-server.sh`
 
