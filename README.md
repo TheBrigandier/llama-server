@@ -624,10 +624,22 @@ Two consequences for sizing:
   reached 1796 MiB, because the active slot's own state and its checkpoints
   live outside the prompt cache.
 
-Note also that a cache entry is dominated by fixed per-branch cost, not token
-count: a 34k-token branch measured ~838 MiB, of which only ~364 MiB is
-attention KV at the 11 KiB/token derived above. Real sessions here run
-43-52k-token branches, so budget ~1.1 GiB per resident branch.
+Note also that a cache entry is much larger than the 11 KiB/token attention-KV
+figure suggests, because it also carries checkpoint and slot state. Measured
+entry sizes:
+
+| branch size | cache entry |
+|---:|---:|
+| 34k tokens | ~838 MiB (only ~364 MiB of it attention KV) |
+| ~88k tokens | 2,896 MiB |
+| ~125k tokens | ~4 GiB |
+
+**This is why `limited` runs `5120`, not `3072`.** At 3072 a single
+125k-token branch exceeds the entire cache, so it is never stored and every
+return to it reprocesses in full - measured at **125,702 tokens / 190.25s**.
+At 5120 the identical switch cost **5 tokens / 0.32s**, with zero evictions
+and no increase in peak memory. Budget by *entry size at your working context*,
+not per-token: the failure is abrupt, not gradual.
 
 ### systemd memory caps: the actual safety net
 
@@ -642,45 +654,57 @@ each one's cache budget actually is), not one shared number:
 
 | Deployment | `MemoryHigh` | `MemoryMax` | `MemorySwapMax` | Notes |
 |---|---:|---:|---:|---|
-| `full-128k` | `28G` | `30G` | `0` | runs only under `multi-user.target`, so nothing else is competing for RAM and a high ceiling is fine |
+| `full-128k` | `28G` | `30G` | `0` | runs only under `multi-user.target`, so nothing else is competing for RAM and a high ceiling is fine. **Not yet re-validated** - see the swap warning below |
 | `full-256k` | `29G` | `30G` | `0` | same - `multi-user.target` only. Do not copy these numbers to a profile that runs alongside a desktop |
-| `limited` | `21G` | `23G` | `0` | **the graphical.target profile.** Sized from measurement to leave ~8GB of the 31Gi box for the desktop - see below |
+| `limited` | `23G` | `25G` | `4G` | **the graphical.target profile.** Sized from a measured near-full-context worst case - see below |
 
 **`limited` is the profile that needs a real ceiling, and it is the
 hungriest.** Despite the name, it keeps *more* MoE layers on the CPU
 (`ncmoe=33`) than `full-128k` (27) or `full-256k` (32), because it runs on
 `graphical.target` where the GPU is busy. So it uses the most host RAM, while
-being the only one competing with a live desktop session. Its ceilings were
-`25G`/`27G`, leaving ~4GB for everything else on a 31Gi machine - the regime
-where the kernel starts failing allocations for *other* processes. Observed
-symptoms of that were a sound card vanishing and a password manager unable to
-open its database: system-wide allocation failure, not a crash of this
-service. Measured sizing:
+being the only one competing with a live desktop session. **The safe band is
+narrow, and this repo overshot it in both directions before landing.**
 
 ```
-resting          15.74 shmem + 0.50 anon = 16.24 GB
-worst case seen  15.76 shmem + 2.98 anon = 18.74 GB   (3 x 34k-token branches)
+resting                        15.74 shmem + 0.50 anon = 16.24 GiB
+125,701-token ctx + 2nd branch                         = 20.39-21.16 GiB
 ```
 
-`21G`/`23G` clears that worst case and leaves ~8GB for the desktop. Verified
-free: prefill under the tighter caps measured 46.1/45.7/45.2s against
-46.0/45.5/44.9s under the old `25G`/`27G` - identical, with the cache still
-at a 6/6 restore rate.
+| ceilings | outcome |
+|---|---|
+| `25G`/`27G` | only ~4GB left for the desktop - the kernel began failing allocations for *other* processes (sound card vanishing, password manager unable to open its DB). System-wide allocation failure, not a crash of this service. |
+| `21G`/`23G` | too tight. Derived from a 3-branch x 34k-token test peaking at 18.74 GiB, which was **not representative** - a real overnight job reached an 88,591-token context, crossed `MemoryHigh` with no page cache left, and (with `MemorySwapMax=0`) deadlocked for 8 hours. |
+| `23G`/`25G` | current. Clears the measured 21.16 GiB worst case with ~4.6GiB headroom, leaves ~6GiB for the desktop. Validated at a full 131072 context with `oom_kill 0` and no throughput cost. |
 
-#### `MemorySwapMax=0` - without it, `MemoryMax` is not a bound
+The lesson worth carrying: **size against a near-full 131072 context, not a
+synthetic multi-branch workload.** The undersized value looked well-measured
+and was not.
 
-Swap on this box is **zram** (`/dev/zram0`) - compressed RAM, not disk - and
-cgroups default to `memory.swap.max=max`. That combination silently defeats
-the safety net: under pressure the kernel relocates anon/shmem into zram,
-which removes it from `memory.current`, so `MemoryMax` never trips and no
-restart ever happens - while those pages still occupy physical RAM, merely
-charged outside this cgroup. The service escapes its own cap and the
-shortfall lands on the desktop.
+#### `MemorySwapMax` - bounded, because both extremes fail
 
-Setting `MemorySwapMax=0` makes the accounting honest: this service's RAM use
-*is* `memory.current`, hard-capped, and a genuine runaway gets OOM-killed and
-restarted (bounded by `StartLimitBurst`) instead of quietly consuming the
-machine. Check `memory.swap.current` and `oom_kill` - both should stay ~0.
+Swap on this box is **zram** (`/dev/zram0`) - compressed RAM, not disk.
+
+- **Unlimited** (`memory.swap.max=max`, the cgroup default) silently defeats
+  the safety net: under pressure the kernel relocates anon/shmem into zram,
+  removing it from `memory.current`, so `MemoryMax` never trips and no restart
+  happens - while those pages still occupy physical RAM, merely charged
+  outside the cgroup. The service escapes its own cap and the shortfall lands
+  on the desktop.
+- **`0`** is worse. With no swap outlet *and* no reclaimable page cache left,
+  a cgroup that reaches `MemoryHigh` can neither free memory nor be cleanly
+  OOM-killed, so the kernel spins in direct reclaim indefinitely. On
+  2026-07-25 that wedged the server for 8 hours: process in state `D`, 27
+  million `memory.events` `high`, zero HTTP responses, and `oom_kill` still
+  `0`. A silent deadlock is worse than either finishing slowly or dying and
+  restarting.
+- **`4G`** (current, `limited`) gives the kernel an escape valve while keeping
+  total charge bounded at `MemoryMax + 4G`. In validation the valve was barely
+  touched (0.00-0.37 GiB) - it exists to prevent deadlock, not as working
+  space.
+
+Check `memory.swap.current` and `oom_kill` after real use; both should stay
+near zero. If `oom_kill` fires, the cap is genuinely too low - that is the
+*correct* failure, and `StartLimitBurst` bounds the restart loop.
 
 That "throttle at cache-ram=8192" finding came from
 `cat /sys/fs/cgroup/.../llama-server-<profile>.service/memory.events` -

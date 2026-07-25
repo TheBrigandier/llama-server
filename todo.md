@@ -1,125 +1,202 @@
-# todo.md — llama-server
+# todo.md — llama-server tuning handoff
 
-All four `cattle-app` handoff items are done, plus the `ctx-checkpoints`
-regression they turned up. Everything is uncommitted by request.
+Working notes for continued tuning. Written to be picked up by a fresh session
+(likely Claude Code on the CLI, to allow `multi-user.target` testing).
 
-1. **Restart loop** — fixed. All three units now carry `StartLimitIntervalSec`
-   / `StartLimitBurst` and `RestartSec=30`.
-2. **`TimeoutStartSec=300`** — dropped from all three; comment now records why
-   it was inert and warns the inherited 15s default becomes live if `Type=`
-   changes.
-3. **`--cache-reuse`** — measured, refused by the server
-   (`cache_reuse is not supported by this context, it will be disabled`).
-   Documented in README as permanently inert here.
-4. **Doc corrections** — branch budget now names title/summary traffic;
-   sampling flags documented as per-request defaults clients override.
-5. **`ctx-checkpoints` regression** — found and fixed, see below.
+**Everything below is uncommitted** unless you've since committed it. Delete
+this file once `full-128k` and `full-256k` are validated.
 
 ---
 
-## What the `ctx-checkpoints` measurement actually showed
+## 1. Current state
 
-`LLAMA_CTX_CHECKPOINTS=0` was set on 2026-07-23 as "pure overhead, no
-tradeoff". It was the cause of the post-2026-07-23 slowdown.
+| profile | ncmoe | ctx | cache-ram | ctx-checkpoints | MemoryHigh | MemoryMax | MemorySwapMax | validated? |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `limited` | 33 | 131072 | **5120** | 8 | **23G** | **25G** | **4G** | **yes** — full 131k context |
+| `full-128k` | 27 | 131072 | 8192 | 32 | 28G | 30G | 4G | **no** — caps provisional |
+| `full-256k` | 32 | 262144 | 8192 | 32 | 29G | 30G | 4G | **no** — caps provisional |
 
-Checkpoints are the mechanism the prompt cache needs to *resume* a branch.
-Recurrent state can't be rewound, so with `0` the server recognises a cached
-prefix and then reprocesses all of it anyway. Measured on `limited`, b10087,
-alternating two conversations (the orchestrator↔subagent case):
+Repo `config/*.env.example` and live `~/.config/llama-server/*.env` are in sync
+on every functional line (comments differ only where noted).
 
-| `--ctx-checkpoints` | return to cached branch | prefill | anon growth |
-|---:|---|---|---|
-| `0` | 11431 / 11431 tokens | 12.97 s | 472 MiB |
-| `4` | 25 tokens | 0.31 s | 1190 MiB |
-| `8` | 25 tokens | 0.26 s | 1190 MiB |
-| `32` | 25 tokens | 0.29 s | 1190 MiB |
-
-Only `0` differs. `N` is a **ceiling, not a reservation** — allocation is on
-demand, which is why 4/8/32 cost the same.
-
-**Applied:** `32` on `full-128k`/`full-256k` (llama-server's default), `8` on
-`limited` (tighter bound for the desktop-sharing profile; its documented
-working set is exactly the 2 branches this test covers). Set in both
-`config/*.env.example` and the live `~/.config/llama-server/*.env`.
-
-**Two traps that made the original wrong conclusion look solid** — both now
-written into `AGENTS.md` so they don't recur:
-
-- An append-only conversation reuses its prefix fine *without* checkpoints
-  (only turn 2 suffers: 20.2% of tokens reprocessed vs 18.4% with them on).
-  Benchmarking a single growing chat hides the entire problem.
-- "No `checkpoint`/`restoring` log lines exist" proved nothing — this build
-  emits none at default verbosity even when restore provably works.
-
-## Verified on the live config
-
-`limited` restarted on `ctx-checkpoints=8`: branch restore confirmed
-(25 / 25 / 18 tokens, ~0.3 s). Footprint against its 25G/27G ceilings:
-
-```
-anon           1.5 GB   prompt cache + checkpoints
-shmem         15.8 GB   model weights (swap-only, NOT page cache)
-inactive_file  6.5 GB   redundant page cache from --no-mmap reading the GGUF
-memory.current 23.9 GB  peak 25.0 GB
-swap.current   0.16 GB  oom_kill 0
-```
-
-The `memory.events` `high` counter climbs into the tens of thousands, but
-that is the kernel dropping the redundant `inactive_file` copy — free, and
-not a sign the ceiling is too tight. Swap and OOM counters stay ~0. No
-ceiling change needed.
+**Target constraint:** `full-128k`/`full-256k` require `multi-user.target` —
+the GPU must be free. They will not load from a desktop session, and because
+each unit `Conflicts=` the other two, a failed start also stops `limited`.
+`limited` is the `graphical.target` profile and, despite the name, the most
+host-RAM-hungry (higher `ncmoe` = more MoE layers on CPU).
 
 ---
 
-## `--cache-ram` validated (and the desktop-crash cause found)
+## 2. What was measured, and what it overturned
 
-Re-measured with checkpoints on. **`--cache-ram` is a cap, not a reservation**
-— the same 3-branch workload allocated 2515 MiB under an `8192` ceiling and
-2550 MiB under `3072`. Lowering it saves nothing until the working set crosses
-it, then fails abruptly:
+### ctx-checkpoints — must be non-zero
+Was `0` everywhere on the belief that checkpoints never restore on this hybrid
+architecture. **False.** Checkpoints are what lets the prompt cache restore a
+branch; recurrent state can't be rewound, so with `0` there is nothing to
+resume from.
 
-| `cache-ram` | restore | evictions | anon | behaviour |
-|---:|---|---:|---:|---|
-| 8192 | 6/6 | 0 | 2515 MiB | cap never reached |
-| 3072 | 6/6 | 0 | 2550 MiB | fits, ~500 MiB spare |
-| 1024 | 0/6 | 7 | 1796 MiB | thrashing |
-| 512 | 0/6 | 0 | 795 MiB | nothing cacheable |
+| `ctx-checkpoints` | branch restore | anon delta |
+|---:|---|---:|
+| 0 | fails — full 11–14k reprocess, 13–16s | 472 MiB |
+| 4 / 8 / 32 | 25 tok, ~0.3s | 1190 MiB (identical) |
 
-So there was no memory to save here. Left at `3072`/`8192`.
+`N` is a **ceiling, not a reservation** (demand-allocated), which is why 4, 8
+and 32 cost the same. The original wrong conclusion came from two bad tests:
+an append-only chat reuses its prefix fine even at `0` (only turn 2 suffers),
+and "no `checkpoint`/`restoring` log lines exist" proves nothing — this build
+emits none at default verbosity even when restore provably works.
 
-**The actual cause of the desktop instability** (sound card vanishing,
-1Password unable to open its DB — kernel-level allocation failures):
+### cache-ram — a cap, not a reservation, and 3072 was silently broken
+Same workload allocated 2515 MiB under an `8192` ceiling and 2550 MiB under
+`3072`. Lowering it frees nothing until the working set crosses it, then fails
+abruptly.
 
-1. `limited` is the `graphical.target` profile *and* the most host-RAM-hungry
-   (`ncmoe=33` > full-128k's 27), yet ran with `25G`/`27G` ceilings on a 31Gi
-   box — ~4GB left for the whole desktop.
-2. **`MemoryMax` could not bind.** Swap is zram (compressed RAM) with
-   `memory.swap.max=max`, so under pressure the cgroup pushed pages into zram,
-   out of `memory.current`. `MemoryMax` never tripped, nothing restarted, and
-   the RAM was still consumed — charged outside the cgroup.
+Cache entries are far larger than the ~11 KiB/token attention-KV figure
+implies, because they also carry checkpoint and slot state:
 
-**Fixed:** `MemorySwapMax=0` on all three units (makes `MemoryMax` real);
-`limited` lowered to `21G`/`23G`. Measured resting 16.24 GB, worst case
-18.74 GB, so the cap clears it with ~4GB spare and leaves ~8GB for the
-desktop. `full-*` ceilings untouched — they only run under
-`multi-user.target` with nothing competing.
+| branch | entry size |
+|---:|---:|
+| 34k tok | ~838 MiB (only ~364 MiB attention KV) |
+| ~88k tok | 2,896 MiB |
+| ~125k tok | ~4 GiB |
 
-**Verified free:** prefill under the new caps is 46.1/45.7/45.2s vs
-46.0/45.5/44.9s under the old ones (controlled A/B via a temporary drop-in),
-with the cache still at 6/6 restores, `oom_kill 0`, `swap.current 0`.
+At `3072` a single ~125k-token branch **exceeds the whole cache**, so it is
+never stored: returning to it reprocessed **125,702 tokens / 190.25s**. At
+`5120`: **5 tokens / 0.32s**. Hence `limited` → 5120.
 
-## Still open / worth knowing
-- **`StartLimit` was loosened to `300s`/`5`** after the initial `600s`/`3`
-  blocked a legitimate tuning session on the fourth restart (manual restarts
-  count toward the limit). Revert to `600`/`3` if you prefer strictness over
-  iteration comfort.
-- ~~**Config drift:** `config/limited.env.example` ships `LLAMA_NCMOE=38`~~
-  **Resolved:** the example now ships `33`, matching the live file. `33` is
-  correct — there is VRAM headroom for it during normal desktop use, and it
-  means less host RAM and faster generation. This mattered for safety too: the
-  16.24 GB resting footprint the new memory ceilings are sized against was
-  measured at `ncmoe=33`, so a reclone installing `38` would have pushed more
-  weight into host RAM than those caps assume.
-- Repro scripts are in the session scratchpad (`branch_switch.py`,
-  `ckpt_sweep.py`, `gguf_meta.py`) — copy them somewhere durable if you want
-  to re-run any of this.
+### The 8-hour deadlock (root cause of the overnight hang)
+`MemoryHigh=21G` + `MemorySwapMax=0` was sized from a 3×34k-token test peaking
+at 18.74 GiB. A real job hit an **88,591-token** context. With no reclaimable
+page cache left *and* no swap outlet, the cgroup could neither free memory nor
+be cleanly OOM-killed — the kernel spun in direct reclaim for 8 hours:
+process state `D`, 27M `memory.events` `high`, zero HTTP responses,
+`oom_kill` still `0`.
+
+Recovered **live, without restarting**, via
+`systemctl --user set-property --runtime ... MemoryHigh=23G MemoryMax=25G MemorySwapMax=4G`.
+OpenCode resumed as if nothing had happened.
+
+**`MemorySwapMax` must be bounded — both extremes fail.** Unlimited (cgroup
+default) lets the kernel push pages into zram (compressed RAM, not disk), out
+of `memory.current`, so `MemoryMax` never trips while the RAM is still
+consumed — that caused desktop-wide allocation failures (sound card vanishing,
+1Password unable to open its DB) with `oom_kill 0`. `0` permits the deadlock
+above. `4G` keeps total charge bounded at `MemoryMax + 4G` with an escape valve.
+
+### `limited` measured numbers (2026-07-25)
+```
+resting unreclaimable (anon+shmem)          16.24 GiB
+peak, 125,701-tok ctx + 2nd branch     20.39–21.16 GiB
+headroom under the 25G cap                   ~4.6 GiB
+desktop left                        ~6 GiB (never below 6.6 Gi observed)
+validation      oom_kill 0, swap untouched, prefill 194s vs 193s
+```
+
+---
+
+## 3. Measurement tooling
+
+Lives in **`~/.config/llama-server/testing/`** (outside the repo deliberately,
+same rationale as the tunables files; move into the repo if you want it
+committed).
+
+| file | purpose |
+|---|---|
+| `measure-profile.sh <profile> [target_tokens]` | end-to-end: raises caps (runtime only), restarts, samples, drives context, prints peak, reverts |
+| `memsample.sh <profile>` | standalone sampler; writes `peaks-<profile>.txt` |
+| `ctx_fill.py` | grows one conversation to `TARGET_TOKENS`, then layers a 2nd branch |
+| `cacheram_test.py` | 3-branch cycle; reports restore hit rate (for cache-ram sizing) |
+| `branch_switch.py` | 2-branch A/B/A switch (for ctx-checkpoints sizing) |
+| `gguf_meta.py <model.gguf>` | dumps GGUF architecture metadata, no model load |
+
+**Measure `anon`+`shmem`, never `memory.current` alone.** The model's host-side
+weights are in **shmem**, and `memory.current` is dominated by page cache from
+reading a 22GB GGUF under `--no-mmap`. `anon` alone hides the model (~0.5 GiB
+at rest vs 16.24 GiB real); `memory.current` overstates it.
+
+A climbing `memory.events` `high` — even `max` — counter is **not** by itself a
+problem: that's free page-cache reclaim, and throughput was measurably
+identical with the counter in the tens of thousands. The reading that *is*
+alarming: unreclaimable approaching `MemoryMax` with page cache at zero. That's
+the deadlock precondition. Judge by `anon+shmem`, `memory.swap.current`,
+`oom_kill`.
+
+---
+
+## 4. Next: validate `full-128k`, then `full-256k`
+
+Both need a session that survives leaving `graphical.target` — a TTY, or SSH
+from another machine.
+
+```sh
+sudo systemctl isolate multi-user.target      # desktop goes away
+
+cd ~/.config/llama-server/testing
+./measure-profile.sh full-128k                # ~118k target, 131072 ctx
+./measure-profile.sh full-256k 250000         # near-full for 262144 ctx
+```
+
+Each run takes roughly 5–8 minutes (model load ~70–90s, context fill ~200s at
+~600 tok/s prefill, plus the branch phase).
+
+**Then size from the output:**
+- `MemoryMax` ≥ peak unreclaimable **+ ~4 GiB** headroom.
+- `MemoryHigh` ≈ `MemoryMax − 2G`.
+- Under `multi-user.target` there's no desktop to protect, so ceilings can stay
+  high — but `full-256k` at `30G` on a 31Gi box leaves ~1 GiB, which is thin
+  even with nothing else running. Expect its 262144 ctx to need more than
+  `full-128k`: the KV cache is allocated for the full `n_ctx` up front.
+- Keep `MemorySwapMax=4G`.
+
+**Pass criteria:** `oom_kill 0`, no process in state `D`, `/health` answers
+promptly throughout, and the `ctx_fill` branch-switch line shows a small
+`reproc` (cache restoring) rather than a full reprocess.
+
+**`cache-ram` for `full-256k` is the open question.** Both full profiles ship
+`8192`. If a ~250k-token branch produces an entry near ~8 GiB — plausible, given
+~4 GiB at 125k — then `8192` has exactly the `limited`-at-3072 problem: one
+branch won't fit and every switch is a full reprocess (which at 250k would be
+~6 minutes). Watch the branch-switch line specifically; raise `cache-ram` if
+`reproc` comes back large, and re-check the ceiling afterwards.
+
+Afterwards: `sudo systemctl isolate graphical.target` and confirm `limited`
+comes back (`systemctl --user status llama-server-limited`).
+
+---
+
+## 5. Pitfalls hit during this work
+
+- **`pgrep -f` / `pkill -f` match your own shell** when the pattern appears in
+  the command line — killed the session twice. Use a PID file, or
+  `ps -eo pid,args | awk '/pattern/ && !/awk/'`.
+- **`systemctl set-property --runtime` survives a service restart.** It writes a
+  drop-in under `/run/user/<uid>/systemd/user.control/` that lasts until reboot.
+  Clear it with `systemctl --user revert <unit>` — restarting is not enough,
+  and you'll silently measure under the wrong caps.
+- **`StartLimitBurst` counts manual restarts.** Currently 5 per 300s (was 3 per
+  600s, which blocked a tuning session on the 4th restart). Clear a tripped
+  limit with `systemctl --user reset-failed <unit>`.
+- **`Conflicts=`** means starting any profile stops the other two — including a
+  profile that then fails to load.
+- **Don't compare timings across sessions.** A "14% prefill regression" I
+  attributed to tighter caps disappeared under a controlled A/B via a temporary
+  drop-in. Always A/B in the same sitting.
+
+---
+
+## 6. Still open
+
+- `full-128k` / `full-256k` ceilings unvalidated (section 4). Marked provisional
+  inline in both unit files.
+- **`--cache-ram` sizing narrative in README** is corrected for `limited` but
+  the original 1024-vs-8192 comparison it grew from was measured while
+  checkpoints were `0`, i.e. while branch restore was broken. The reprocess
+  rates were real; *why* they moved is not established. Flagged inline.
+- `--cache-reuse` is permanently inert here — server refuses it
+  (`cache_reuse is not supported by this context, it will be disabled`), since
+  KV shifting isn't supported on recurrent layers. Documented; don't retry.
+- `limited` is under extended real-use testing by the user as of 2026-07-25.
+  If it wedges again: check `oom_kill` (should be 0), process state (`D` = the
+  reclaim deadlock), and whether `anon+shmem` reached `MemoryMax`. The live
+  rescue is `set-property --runtime` with higher caps — no restart needed, and
+  in-flight client requests survive.

@@ -64,19 +64,28 @@ RestartSec=30
 # `systemctl --user status llama-server-full-128k` peak memory and adjust.
 MemoryHigh=28G
 MemoryMax=30G
-# Without this, MemoryMax above is NOT a real bound. Swap on this box is zram
-# (/dev/zram0, compressed RAM - not disk) and the cgroup defaults to
-# memory.swap.max=max, so under pressure the kernel relocates anon/shmem into
-# zram, dropping it out of memory.current: MemoryMax never trips, no restart
-# happens, and the pages still occupy physical RAM charged outside this
-# cgroup. 0 keeps the accounting honest - a genuine runaway is OOM-killed and
-# restarted (see StartLimit above) rather than quietly eating the box.
+# Bounded, deliberately neither unlimited nor 0. Unlimited (the cgroup
+# default) defeats MemoryMax: swap here is zram (/dev/zram0, compressed RAM -
+# not disk), so the kernel relocates anon/shmem into zram, dropping it out of
+# memory.current - the cap never trips while the RAM is still consumed,
+# charged outside this cgroup. But 0 is worse: with no swap outlet AND no
+# reclaimable page cache left, a cgroup at MemoryHigh can neither free memory
+# nor be cleanly OOM-killed, and the kernel spins in direct reclaim forever.
+# That deadlocked `limited` for 8 hours on 2026-07-25 (state D, 27M
+# memory.events "high", zero HTTP responses, oom_kill still 0). 4G leaves an
+# escape valve while keeping total charge bounded at MemoryMax + 4G.
 #
-# The ceilings above stay high (unlike `limited`'s 20G/22G) because this
+# The ceilings above stay high (unlike `limited`'s 23G/25G) because this
 # profile only runs under multi-user.target, with no desktop session
 # competing for RAM. Don't copy these numbers to a profile that runs on
 # graphical.target.
-MemorySwapMax=0
+#
+# NOT YET VALIDATED against a near-full context: this profile cannot be
+# started from a graphical session, so the near-full-131072 measurement that
+# re-sized `limited` has not been repeated here. `limited`'s ceilings proved
+# wrong by ~2.5GiB when sized from a synthetic test - treat these as
+# provisional and re-measure under multi-user.target before trusting them.
+MemorySwapMax=4G
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop
 # session isn't.

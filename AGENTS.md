@@ -67,13 +67,15 @@ only the relevant `.env` file.
 - **`LLAMA_CACHE_RAM` is set explicitly in every `config/*.env.example`, but
   is NOT the same value across all three** - don't "consolidate" it back to
   one number. `full-128k`/`full-256k` use `8192` (llama-server's own
-  default, matching rather than overriding it down). `limited` uses `3072`,
-  smaller because its `MemoryMax` is tighter - **not** because it only ever
-  needs 2 branches. That older rationale was measured wrong on 2026-07-25: 3
-  branches x 34k tokens needed 2550 MiB, leaving `3072` only ~500 MiB spare,
-  and real sessions here run 43-52k-token branches (~1.1 GiB each). See the
-  cap-not-a-reservation bullet below before touching any of these. This repo
-  briefly
+  default). `limited` uses `5120`, raised from `3072` on 2026-07-25: at 3072
+  a single ~125k-token branch (~4 GiB as a cache entry) could not be cached
+  **at all**, so every switch back to it reprocessed the entire prompt -
+  125702 tokens, 190.25s. At 5120 the same switch cost 5 tokens and 0.32s.
+  The old "~11 KiB/token, so 2 branches fit in 3072" reasoning is right about
+  attention KV but badly understates a real entry, which also carries
+  checkpoint and slot state (measured: 2896 MiB for an ~88k-token branch).
+  The failure mode is abrupt, not gradual - the cache doesn't degrade, it
+  stops working once one entry no longer fits. This repo briefly
   shipped `1024` on all three under the assumption that shrinking it was a
   free memory-stability win - it wasn't: this repo's sequential-subagent
   workflow needs the orchestrator's branch and the active subagent's
@@ -96,14 +98,18 @@ only the relevant `.env` file.
   unit to test something while a desktop session is running** - it will fail
   to load, and `Conflicts=` will have stopped `limited` on the way. Measure on
   `limited`.
-- **`MemorySwapMax=0` must stay set on every unit.** Swap here is zram
-  (compressed RAM, not disk) and cgroups default to `memory.swap.max=max`,
-  which lets the cgroup push pages into zram, out of `memory.current`, so
-  `MemoryMax` never trips while the RAM is still consumed - charged outside
-  the cgroup. Without this line the memory caps are decorative. Verified by
-  the failure it caused: desktop-wide allocation failures (sound card
-  disappearing, password manager unable to open its DB) with `oom_kill` at 0
-  and no service restart.
+- **`MemorySwapMax` must be BOUNDED - neither unlimited nor `0`.** Both
+  extremes were tried and both failed on this box. Unlimited (the cgroup
+  default) defeats `MemoryMax`: swap here is zram (compressed RAM, not disk),
+  so the kernel relocates anon/shmem into zram, out of `memory.current`, and
+  the cap never trips while the RAM is still consumed - that produced
+  desktop-wide allocation failures (sound card gone, password manager unable
+  to open its DB) with `oom_kill` at 0. Then `0` was tried, which is worse:
+  with no swap outlet *and* no reclaimable page cache left, a cgroup at
+  `MemoryHigh` can neither free memory nor be cleanly OOM-killed, so the
+  kernel spins in direct reclaim forever - that wedged the server for 8 hours
+  (state `D`, 27M `high` events, zero HTTP responses, `oom_kill` still 0).
+  `limited` uses `4G`. A silent deadlock is worse than a clean restart.
 - **`--cache-ram` is a cap, not a reservation - don't "save" memory with it.**
   The same workload allocated 2515 MiB under `8192` and 2550 MiB under `3072`.
   Lowering it frees nothing until the working set crosses it, and then the
@@ -114,14 +120,20 @@ only the relevant `.env` file.
 - **systemd `MemoryHigh`/`MemoryMax` differ per deployment and aren't
   arbitrary either** - `full-128k` (28G/30G) and `full-256k` (29G/30G) stay
   high because they only run under `multi-user.target` with no desktop
-  competing. `limited` is **21G/23G**, sized from measurement (resting
-  16.24 GB, worst case 18.74 GB at `ncmoe=33`) to leave ~8GB of the 31Gi box
-  for the desktop; its previous 25G/27G left only ~4GB and caused
-  system-wide allocation failures. Verified free: prefill is identical under
-  both. Don't push any cap to within ~1Gi of total system RAM, and don't
-  raise `limited`'s without re-measuring - `ncmoe` changes move weight
-  between VRAM and host RAM, so the footprint these are sized against is
-  tied to that value.
+  competing. `limited` is **23G/25G**, and the safe band is narrow in both
+  directions:
+  - `25G/27G` left only ~4GB for the desktop -> system-wide allocation
+    failures.
+  - `21G/23G` was too tight -> the 8-hour reclaim deadlock described above.
+    That number came from a 3-branches-x-34k-token test peaking at 18.74 GB,
+    which was **not representative**.
+  - `23G/25G` clears the real measured worst case - a 125,701-token context
+    plus a second branch peaks at **20.39-21.16 GiB** unreclaimable - with
+    ~4.6GiB headroom, leaving ~6GiB for the desktop.
+
+  **Size against a near-full 131072 context, not a synthetic multi-branch
+  test.** And re-measure if `ncmoe` changes: it moves weight between VRAM and
+  host RAM, so the footprint these are sized against is tied to that value.
 - **Don't trust a cgroup sitting flat at exactly its own `MemoryHigh` value
   as proof that's the real resting footprint** - `MemoryHigh` actively
   reclaims to hold usage at/below itself, so a process pinned there (even
@@ -135,10 +147,14 @@ only the relevant `.env` file.
   The converse also holds, though: a climbing `high` counter is **not** by
   itself proof a ceiling is too tight. Most of `memory.current` here is page
   cache from reading a 22GB GGUF under `--no-mmap`, which reclaims for free.
-  At `limited`'s current 21G/23G the counter runs into the tens of thousands
-  while prefill throughput is measurably identical to the old looser caps.
-  Judge by `anon`+`shmem`, `memory.swap.current` and `oom_kill`, not by
-  `high`.
+  At `limited`'s `23G`/`25G` the `high` and even `max` counters climb into the
+  thousands while prefill throughput is measurably identical to looser caps
+  and `oom_kill` stays `0` - that is page cache being reclaimed at the
+  ceiling, which is free. Judge by `anon`+`shmem` against the cap (peak
+  20.39 GiB vs a 25G limit = 4.6GiB of genuine headroom),
+  `memory.swap.current` and `oom_kill` - never by `high` alone. The one
+  reading that *is* alarming is unreclaimable memory approaching `MemoryMax`
+  with page cache already at zero: that is the deadlock precondition.
 - **Sampling defaults** (`temp=1.0, top_p=0.95, top_k=20,
   presence_penalty=1.5`) are always applied unless overridden - they come
   from the model card's "thinking mode" recommendation, not llama.cpp's

@@ -51,14 +51,13 @@ RestartSec=30
 # Safety net for a desktop box also used for browsing: cap this cgroup so a
 # runaway (a genuine leak, a bad tunable, anything else) gets killed
 # and restarted by systemd instead of taking down the whole session via the
-# system-wide OOM killer. This profile's cache-ram stays at 3072 MiB (not
-# the 8192 the other two use) because the ceilings below are tighter, not
-# because a third branch "never happens" - measurement showed 3 branches
-# x 34k tokens fitting in 3072 with only ~500 MiB to spare, and real
-# sessions here run 43-52k-token branches. Note --cache-ram is a CAP, not a
-# reservation: raising it costs nothing until the workload uses it, so the
-# limiting factor is MemoryMax below, not this number. See limited.env's
-# comments and README's "Memory stability" section.
+# system-wide OOM killer. This profile runs cache-ram=5120, raised from 3072
+# after measuring a near-full context: at 131072 ctx a single ~125k-token
+# branch needs ~4 GiB of prompt cache, so 3072 could not hold even ONE and
+# every branch switch reprocessed the whole prompt (125702 tokens, 190s).
+# At 5120 the same switch cost 5 tokens and 0.32s. --cache-ram is a CAP, not
+# a reservation, so the limiting factor is MemoryMax below, not this number.
+# See limited.env's comments and README's "Memory stability" section.
 #
 # This profile is the one that shares RAM with a live desktop session, and
 # despite the name it is the *most* host-RAM-hungry of the three: it runs on
@@ -67,38 +66,54 @@ RestartSec=30
 # are fine because they only run under multi-user.target with nothing else
 # competing; this one has to leave a desktop alive.
 #
-# Sized from measurement (2026-07-25), not estimate. The number that matters
-# is anon+shmem - memory that CANNOT be reclaimed cheaply:
-#     resting            15.74 shmem + 0.50 anon = 16.24 GB
-#     worst case seen    15.74 shmem + 3.07 anon = 18.8 GB
-#                        (3 branches x 34k tokens saturating cache-ram=3072)
-# 21G/23G clears that worst case while leaving ~8GB of the 31Gi box for the
-# desktop. MemoryHigh sits just above the observed 20.04GB peak on purpose:
-# at 20G it engaged during every prefill and cost ~14% throughput (45.8s vs
-# 40.0s on the same 34k-token seed) for no safety benefit, since MemoryMax
-# is the actual bound. The previous 25G/27G left only ~4GB, which is the regime
-# where the kernel starts failing allocations for *other* processes - the
-# reported symptoms were a sound card disappearing and 1Password unable to
-# open its database, i.e. system-wide allocation failure, not a crash of
-# this service.
+# Sized from measurement against a NEAR-FULL CONTEXT (2026-07-25). The number
+# that matters is anon+shmem - memory that cannot be reclaimed cheaply:
+#     resting                     15.74 shmem + 0.50 anon = 16.24 GiB
+#     125,701-token ctx + 2nd branch                      = 21.16 GiB
 #
-# Do not judge these by memory.current alone: most of it is page cache from
+# An earlier pass sized these at 21G/23G from a 3-branches-x-34k-token test
+# that peaked at only 18.8 GiB. That workload was not representative, and the
+# undersizing wedged the server: an overnight job reached an 88,591-token
+# context, crossed MemoryHigh with zero page cache left to reclaim and (then)
+# MemorySwapMax=0, and the kernel spun in direct reclaim for 8 hours - state
+# D, no HTTP responses, no OOM kill, no restart. Size this against a full
+# 131072 context, not a synthetic multi-branch test.
+#
+# 23G/25G clears the 21.16 GiB worst case with ~2GiB of headroom above
+# MemoryHigh and ~4GiB below the hard cap, leaving ~6GiB of the 31Gi box for
+# the desktop. Do not go back below ~23G: the previous 25G/27G left only
+# ~4GB and caused desktop-wide allocation failures (sound card disappearing,
+# password manager unable to open its DB), while 21G/23G caused the deadlock
+# above. The safe band is narrow.
+#
+# Do not judge these by memory.current alone: much of it is page cache from
 # reading a 22GB GGUF under --no-mmap, which reclaims for free and makes the
 # memory.events "high" counter look alarming when nothing is wrong. Check
 # anon+shmem, memory.swap.current and oom_kill instead. See README's "Memory
 # stability" section.
-MemoryHigh=21G
-MemoryMax=23G
-# Without this, MemoryMax above is NOT a real bound. Swap on this box is
-# zram (/dev/zram0, compressed RAM - not disk), and the cgroup defaulted to
-# memory.swap.max=max. Under pressure the kernel would relocate anon/shmem
-# into zram, which drops it out of memory.current so MemoryMax never trips
-# and no restart ever happens - while the pages still occupy physical RAM,
-# just charged outside this cgroup. The cap escaped itself and the shortfall
-# landed on the desktop. 0 keeps the accounting honest: this service's RAM
-# use is memory.current, hard-capped, and a genuine runaway gets OOM-killed
-# and restarted (see StartLimit above) instead of quietly eating the system.
-MemorySwapMax=0
+MemoryHigh=23G
+MemoryMax=25G
+# Bounded, deliberately NOT 0 and NOT unlimited - both extremes fail here.
+#
+# Unlimited (the cgroup default, memory.swap.max=max) defeats MemoryMax:
+# swap on this box is zram (/dev/zram0, compressed RAM - not disk), so under
+# pressure the kernel relocates anon/shmem into zram, dropping it out of
+# memory.current. MemoryMax never trips, nothing restarts, and the pages
+# still occupy physical RAM - just charged outside this cgroup. The cap
+# escapes itself and the shortfall lands on the desktop.
+#
+# 0 was tried next and is worse: with no swap outlet AND no reclaimable page
+# cache left, a cgroup that reaches MemoryHigh can neither free memory nor be
+# cleanly OOM-killed, so the kernel spins in direct reclaim indefinitely. That
+# is what wedged the server for 8 hours on 2026-07-25 (process in state D,
+# 27M memory.events "high", zero HTTP responses, oom_kill still 0). A silent
+# deadlock is worse than either finishing slowly or dying and restarting.
+#
+# 4G gives the kernel an escape valve while keeping MemoryMax meaningful -
+# total charge stays bounded at MemoryMax + 4G. In validation the valve was
+# barely used (0.00-0.37 GiB), which is the point: it exists to prevent
+# deadlock, not to be a working surface.
+MemorySwapMax=4G
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop
 # session isn't.

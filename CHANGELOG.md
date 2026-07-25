@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-07-25 (later) - `limited` re-tuned against a real workload
+
+The memory caps set earlier the same day were sized from an unrepresentative
+test and **wedged the server for 8 hours overnight**. Re-measured properly.
+
+- **The failure.** An overnight agent job reached an 88,591-token context.
+  With `MemoryHigh=21G` and `MemorySwapMax=0`, the cgroup crossed the
+  threshold with zero reclaimable page cache and no swap outlet, so the kernel
+  could neither free memory nor OOM-kill cleanly - it spun in direct reclaim.
+  Process stuck in state `D`, 27M `memory.events` `high`, no HTTP responses,
+  `oom_kill` still `0`. Recovered live with `systemctl set-property --runtime`
+  (raising the cap unstuck it without a restart; the client resumed as if
+  nothing had happened).
+- **Root cause of the bad number.** `21G`/`23G` came from a 3-branch x
+  34k-token workload peaking at 18.74 GiB. A near-full 131072 context peaks at
+  **20.39-21.16 GiB**. Sizing now uses the latter.
+- **`MemoryHigh`/`MemoryMax` -> `23G`/`25G`** on `limited`: clears the real
+  worst case with ~4.6GiB headroom, ~6GiB left for the desktop.
+- **`MemorySwapMax` -> `4G`** (was `0`). Both extremes fail: unlimited lets
+  the cgroup escape `MemoryMax` via zram, `0` allows the deadlock above. A
+  bounded valve keeps the cap meaningful without permitting a hang.
+- **`--cache-ram` -> `5120`** on `limited` (was `3072`). A ~125k-token branch
+  is a ~4 GiB cache entry, so at 3072 it could not be cached at all and every
+  branch switch reprocessed everything: **125,702 tokens / 190.25s**. At 5120
+  the same switch cost **5 tokens / 0.32s**. Entry sizes measured at 2,896 MiB
+  for ~88k tokens - far above what the ~11 KiB/token attention-KV figure
+  implies, because entries also carry checkpoint and slot state.
+- Validated end to end at a full 131072 context under the final caps:
+  `oom_kill 0`, swap untouched, no deadlock, prefill unchanged (194s vs 193s).
+
+`full-128k`/`full-256k` are **not** re-validated - they require
+`multi-user.target` and could not be tested from a desktop session. They still
+carry `MemorySwapMax=0`, which is now known to permit this deadlock.
+
 ## 2026-07-25
 
 **Context checkpoints re-enabled - the 2026-07-23 change below was wrong.**
