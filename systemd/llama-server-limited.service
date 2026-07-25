@@ -2,6 +2,27 @@
 Description=llama-server (profile: limited) - reduced VRAM footprint, for sharing the GPU with a desktop session
 Documentation=file:%h/llama-server/README.md
 Conflicts=llama-server-full-128k.service llama-server-full-256k.service
+# Give up instead of restarting forever on a *persistent* failure. systemd's
+# defaults here (verified on this box with `systemctl --user show -p
+# DefaultStartLimitIntervalUSec -p DefaultStartLimitBurst`: 10s / 5) can
+# never be tripped by this unit, because RestartSec is longer than
+# interval/burst - at one restart per 5s only 2 starts land in a 10s window,
+# the counter resets, and a unit that fails every single time restarts
+# indefinitely. The realistic persistent failure on this box is the cgroup
+# OOM kill that MemoryMax below is *designed* to cause, and each iteration
+# re-reads 22GB from disk under --no-mmap, so the safety net would otherwise
+# become the trigger for an unbounded reload loop. At RestartSec=30 a
+# genuinely broken config burns its 5 tries in ~2 minutes, then enters
+# `failed` and stays there for a human (`systemctl --user reset-failed
+# <unit>` to clear).
+#
+# 5/300 rather than a tighter 3/600 because *manual* restarts count toward
+# this limit too, and this repo's workflow is "edit the tunables file,
+# restart, observe". 3-per-10-minutes was tried first and blocked a
+# legitimate tuning session on the fourth restart - tight enough to stop a
+# crash loop is not the same as tight enough to fight the operator.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -12,35 +33,72 @@ WorkingDirectory=%h/llama-server
 # install.sh has been run.
 ExecStart=%h/llama-server/scripts/llm-server.sh --tunables-file %h/.config/llama-server/limited.env
 Restart=on-failure
-RestartSec=5
-TimeoutStartSec=300
+# 30s, not 5s: a restart here re-reads 22GB from disk under --no-mmap, so
+# retrying in 5s only piles a second cold load onto a box that may still be
+# recovering from whatever killed the first one. Costs nothing on a genuine
+# transient, and keeps RestartSec well inside the StartLimit window above.
+RestartSec=30
+# No TimeoutStartSec here on purpose. It used to be 300, described as
+# covering the 22GB model load - it never did: under Type=simple systemd
+# marks the unit active the moment the fork succeeds, so nothing is timed
+# during load (Type=exec wouldn't help either, it only waits for exec()).
+# With it gone the unit inherits DefaultTimeoutStartUSec, 15s on this box,
+# which is equally inert for the same reason. If Type= ever becomes notify
+# or an ExecStartPre/ExecStartPost is added, that 15s default *will* apply
+# and must be raised past the real load time before anything else changes.
+# Making start completion mean "model loaded" needs an ExecStartPost that
+# polls /health, not a timeout.
 # Safety net for a desktop box also used for browsing: cap this cgroup so a
-# runaway (this model's context-checkpoint bug or anything else) gets killed
+# runaway (a genuine leak, a bad tunable, anything else) gets killed
 # and restarted by systemd instead of taking down the whole session via the
-# system-wide OOM killer. Unlike full-128k/full-256k, this profile's
-# cache-ram is deliberately kept small (3072 MiB, not 8192 - see
-# limited.env's own comments and README's "Memory stability" section: this
-# is the profile for sharing RAM with a desktop session, so its ceiling
-# gives that RAM back rather than reserving it for a 3-branch cache this
-# profile never needs).
+# system-wide OOM killer. This profile's cache-ram stays at 3072 MiB (not
+# the 8192 the other two use) because the ceilings below are tighter, not
+# because a third branch "never happens" - measurement showed 3 branches
+# x 34k tokens fitting in 3072 with only ~500 MiB to spare, and real
+# sessions here run 43-52k-token branches. Note --cache-ram is a CAP, not a
+# reservation: raising it costs nothing until the workload uses it, so the
+# limiting factor is MemoryMax below, not this number. See limited.env's
+# comments and README's "Memory stability" section.
 #
-# An earlier MemoryHigh=22G looked "confirmed" at a flat 22.0GiB via
-# `systemctl show -p MemoryCurrent` (idle and during a test generation
-# alike) - but that flatness was `memory.high` itself artificially
-# capping growth via continuous reclaim (that's how memory.high works: it
-# keeps reclaiming to hold usage at/below the threshold), not the real
-# resting footprint. memory.events' "high" counter had climbed into the
-# tens of thousands within ~2 minutes at idle, confirming it was being
-# fought back down rather than genuinely settling there. Raising the
-# ceiling to 25G/27G let it actually settle: idle steady-state (model +
-# ncmoe layers + active slot's KV reservation + cache-ram=3072MiB) is
-# really ~17-18GiB, matching this repo's earlier baseline estimate before
-# the 22G cap muddied the measurement. Watch `systemctl --user status
-# llama-server-limited` peak memory and `memory.events`'s "high" count,
-# and tighten (or loosen) if it's consistently far from the ceiling or
-# throttling again.
-MemoryHigh=25G
-MemoryMax=27G
+# This profile is the one that shares RAM with a live desktop session, and
+# despite the name it is the *most* host-RAM-hungry of the three: it runs on
+# graphical.target where the GPU is busy, so ncmoe=33 keeps more MoE layers
+# on the CPU than full-128k (27) or full-256k (32). full-*'s higher ceilings
+# are fine because they only run under multi-user.target with nothing else
+# competing; this one has to leave a desktop alive.
+#
+# Sized from measurement (2026-07-25), not estimate. The number that matters
+# is anon+shmem - memory that CANNOT be reclaimed cheaply:
+#     resting            15.74 shmem + 0.50 anon = 16.24 GB
+#     worst case seen    15.74 shmem + 3.07 anon = 18.8 GB
+#                        (3 branches x 34k tokens saturating cache-ram=3072)
+# 21G/23G clears that worst case while leaving ~8GB of the 31Gi box for the
+# desktop. MemoryHigh sits just above the observed 20.04GB peak on purpose:
+# at 20G it engaged during every prefill and cost ~14% throughput (45.8s vs
+# 40.0s on the same 34k-token seed) for no safety benefit, since MemoryMax
+# is the actual bound. The previous 25G/27G left only ~4GB, which is the regime
+# where the kernel starts failing allocations for *other* processes - the
+# reported symptoms were a sound card disappearing and 1Password unable to
+# open its database, i.e. system-wide allocation failure, not a crash of
+# this service.
+#
+# Do not judge these by memory.current alone: most of it is page cache from
+# reading a 22GB GGUF under --no-mmap, which reclaims for free and makes the
+# memory.events "high" counter look alarming when nothing is wrong. Check
+# anon+shmem, memory.swap.current and oom_kill instead. See README's "Memory
+# stability" section.
+MemoryHigh=21G
+MemoryMax=23G
+# Without this, MemoryMax above is NOT a real bound. Swap on this box is
+# zram (/dev/zram0, compressed RAM - not disk), and the cgroup defaulted to
+# memory.swap.max=max. Under pressure the kernel would relocate anon/shmem
+# into zram, which drops it out of memory.current so MemoryMax never trips
+# and no restart ever happens - while the pages still occupy physical RAM,
+# just charged outside this cgroup. The cap escaped itself and the shortfall
+# landed on the desktop. 0 keeps the accounting honest: this service's RAM
+# use is memory.current, hard-capped, and a genuine runaway gets OOM-killed
+# and restarted (see StartLimit above) instead of quietly eating the system.
+MemorySwapMax=0
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop
 # session isn't.

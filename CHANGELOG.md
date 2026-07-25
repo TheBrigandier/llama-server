@@ -1,14 +1,71 @@
 # Changelog
 
+## 2026-07-25
+
+**Context checkpoints re-enabled - the 2026-07-23 change below was wrong.**
+
+- `--ctx-checkpoints 0` was not "pure overhead with no tradeoff". Checkpoints
+  are what lets the prompt cache restore a branch on this architecture:
+  recurrent state can't be rewound, so with `0` the server recognises a
+  cached prefix and reprocesses all of it anyway. Measured on `limited`
+  (llama.cpp b10087), returning to a cached branch cost 11431 tokens /
+  12.97s at `0` versus 25 tokens / 0.3s at any non-zero value. This is the
+  slowdown that showed up after 2026-07-23.
+- Set to `32` (llama-server's default) on `full-128k`/`full-256k` and `8` on
+  `limited`. `4`, `8` and `32` measured identical in both benefit and memory
+  - allocation is on demand, so the value is a ceiling, not a reservation.
+- The original evidence was invalid: it inferred "never restored" from the
+  absence of `checkpoint`/`restoring` log lines, but this build emits none at
+  default verbosity even when restore demonstrably works. It also only
+  benchmarked a growing single conversation, which reuses its prefix fine
+  without checkpoints - the cost only appears on branch switches.
+- `--cache-ram` sizing notes in README are flagged as needing re-validation:
+  they were measured while branch restore was broken.
+- `--cache-reuse` tested and documented as permanently inert here - the
+  server refuses it (`cache_reuse is not supported by this context, it will
+  be disabled`), since KV shifting isn't supported on recurrent layers.
+
+**Memory safety - the caps were not actually capping anything.**
+
+- `MemorySwapMax=0` added to all three units. Swap on this box is zram
+  (compressed RAM, not disk) and cgroups default to `memory.swap.max=max`, so
+  under pressure the kernel moved anon/shmem into zram, out of
+  `memory.current` - `MemoryMax` never tripped, nothing restarted, and the RAM
+  was still gone, charged outside the cgroup. This is the mechanism behind
+  desktop-wide allocation failures (sound card disappearing, password manager
+  unable to open its database) with `oom_kill` sitting at 0.
+- `limited` ceilings lowered `25G`/`27G` -> `21G`/`23G`. It is the
+  `graphical.target` profile *and* the most host-RAM-hungry (`ncmoe=33` keeps
+  more MoE layers on CPU than the full profiles), so it was the one squeezing
+  the desktop. Measured resting 16.24 GB, worst case 18.74 GB; the new caps
+  clear that and leave ~8GB for the desktop. Verified free: prefill is
+  identical to the old caps (46.1/45.7/45.2s vs 46.0/45.5/44.9s) with the
+  cache still at a 6/6 restore rate.
+- `full-128k`/`full-256k` ceilings left alone - they only run under
+  `multi-user.target` with no desktop competing.
+- `--cache-ram` characterised: it is a **cap, not a reservation**. Same
+  workload allocated 2515 MiB under `8192` and 2550 MiB under `3072`; lowering
+  it saves nothing until the working set crosses it, then fails abruptly
+  (`1024` -> 0/6 branch restores). The README's older sizing narrative is
+  corrected accordingly.
+
+**systemd units** - `StartLimitIntervalSec`/`StartLimitBurst` added (a
+persistent failure previously restarted forever, because `RestartSec=5` could
+never fill systemd's default 10s/5 window), `RestartSec` raised to 30s, and
+the inert `TimeoutStartSec=300` removed (it never covered model load under
+`Type=simple`).
+
 ## 2026-07-23
 
 **Memory stability** - `llama-server` was slowly eating RAM until it crashed
 (and dragging desktop responsiveness down along the way):
 
-- Context checkpoints (`--ctx-checkpoints`) are known-broken upstream for
+- ~~Context checkpoints (`--ctx-checkpoints`) are known-broken upstream for
   this model's hybrid/recurrent architecture - created but never
   successfully restored, pure overhead. Disabled (`LLAMA_CTX_CHECKPOINTS=0`)
-  in all three deployments.
+  in all three deployments.~~ **Superseded 2026-07-25: this was wrong and was
+  reverted - see the entry above.** Checkpoints do restore, and disabling
+  them broke prompt-cache branch restore.
 - Prompt-cache RAM (`--cache-ram`) defaulted to 8GB, leaving no headroom on
   a 32GB desktop box. Capped to 1GB (`LLAMA_CACHE_RAM=1024`).
 - Added `MemoryHigh=`/`MemoryMax=`/`OOMScoreAdjust=` to all three systemd
@@ -58,10 +115,14 @@ turned out to be wrong, not just conservative:
   kind of workload.
 - `MemoryHigh=`/`MemoryMax=` raised on all three systemd units to match the
   new worst-case ceiling (baseline + up to ~8GB cache).
-- Context checkpoints stay disabled - confirmed unrelated to the slowdown
+- ~~Context checkpoints stay disabled - confirmed unrelated to the slowdown
   (the same full-reprocess pattern existed even before they were disabled,
   and zero checkpoint-restore log lines exist anywhere in this server's
-  history, before or after).
+  history, before or after).~~ **Superseded 2026-07-25.** They were very
+  much related to the slowdown. The "zero log lines" check proved nothing -
+  this build emits none even when restore works - and the surviving
+  full-reprocess pattern was the branch-switch case that disabling
+  checkpoints had itself broken.
 
 ## 2026-07-24
 

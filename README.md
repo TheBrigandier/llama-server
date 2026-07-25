@@ -92,16 +92,21 @@ that vary between these three:
 |--------------|---------:|-------------:|-----:|-------------|
 | `full-128k`  | 27       | 131072       | 12   | Default daily driver - fastest, most layers on GPU |
 | `full-256k`  | 32       | 262144       | 12   | Occasional, when a task genuinely needs more context |
-| `limited`    | 38       | 131072       | 8    | A desktop session is also using the GPU's VRAM |
+| `limited`    | 33       | 131072       | 8    | A desktop session is also using the GPU's VRAM |
 
 Context size always stays within `[131072, 262144]`, enforced by the
 script: the [model card](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
 says the model uses its context window for thinking and response quality
 drops off below ~128k, and 262144 is its native max.
 
-The `limited` numbers are a starting point tuned for a 12GB card sharing
-VRAM with a normal desktop session - if you see OOM errors or heavy
-swapping, raise `-ncmoe` further (more info below); if there's headroom to
+The `limited` numbers are tuned for a 12GB card sharing VRAM with a normal
+desktop session. `-ncmoe 33` is confirmed in practice, not a guess: it was
+lowered from 38 after real desktop use showed the VRAM headroom was there,
+which both cuts host RAM and speeds up token generation. Note the memory
+ceilings in `systemd/llama-server-limited.service` are sized against the
+resting footprint at this value - raising `-ncmoe` moves weight from VRAM
+into host RAM, so raise those caps to match if you do. If you see OOM errors
+or heavy swapping, raise `-ncmoe` (more info below); if there's headroom to
 spare, lower it towards `full-128k`'s value for more speed. Edit
 `~/.config/llama-server/limited.env` and `systemctl --user restart
 llama-server-limited.service` to apply a change.
@@ -134,6 +139,16 @@ without starting it.
   applied unless overridden (`--temp`/`--top-p`/`--top-k`/`--presence-penalty`
   or the matching `LLAMA_*` env vars) - llama-server's generic built-in
   defaults aren't tuned for this model.
+  - **They only apply to requests that don't specify their own.** Any
+    OpenAI-compatible client that sends a sampler block in the request body
+    overrides these per-request, and most send one on every call - OpenCode
+    puts `"temperature":0.6,"top_p":0.95,"presence_penalty":0,"top_k":20,
+    "min_p":0,"repeat_penalty":1` on the wire each time, so the CLI's
+    `presence-penalty 1.5` never reaches it. Keep the flags (they're the
+    fallback for raw `curl` and any client that stays silent), but tune
+    sampling for an agent in *that agent's* config, not here. Confirm what
+    actually applied via `/slots` rather than `/props` - `/props` only
+    reports the server's own CLI-baked baseline.
 - **`--spec-draft-n-max 4`**: tuned by testing on this model/hardware - good
   speedup at 4, draft accept rate falls off sharply at 5. The model card's
   own example uses 2, which is a safer generic starting point if you're
@@ -170,6 +185,20 @@ clients) has no way to query a server for its actual loaded context size;
 materialized twice rather than risking a mismatch against whichever
 deployment (see [Deployments](#deployments-tunables-files)) happens to be
 running.
+
+Two top-level keys matter beyond the model list:
+
+- **`small_model`** points OpenCode's background traffic - session title
+  generation, and the auto-summarization that fires as a session nears its
+  context limit - at `instruct-fast-128k` instead of the main thinking model.
+  Those requests are not agents, but each is a distinct prefix on the same
+  single slot, so this cuts their generation cost substantially. It does
+  **not** remove the slot contention or the cache branch: title generation
+  fires concurrently with the first message of a session and still queues
+  behind it (observed on the wire waiting ~11s). Budget for those branches
+  when sizing `--cache-ram` - see [Memory stability](#memory-stability).
+- **`lsp: true`** enables OpenCode's language-server integration, which is
+  client-side only and has no bearing on this server.
 
 These configs were validated against a real request, not just written from
 docs: with the server running, a differential test - temporarily launching
@@ -328,29 +357,67 @@ On a desktop box also used for browsing, an unbounded `llama-server` is a
 real problem, not just an inefficiency - it can eat enough RAM to force
 swapping or trigger the system-wide OOM killer, which can take down
 anything (browser tabs, the desktop session) rather than just the server.
-This repo handles two different things under that heading - a real bug
-that's pure overhead, and a legitimate cache whose size needs to match how
-this repo is actually used, not just be minimized.
+This repo handles two related things under that heading - a resume mechanism
+that has to stay on for the cache to work at all, and the cache itself, whose
+size needs to match how this repo is actually used rather than just being
+minimized. Both were previously mis-tuned in the direction of "use less RAM",
+and both cost more time than they saved.
 
-### Context checkpoints: disabled, no tradeoff
+### Context checkpoints: ENABLED - they are what makes the prompt cache work
 
 **`--ctx-checkpoints`** (llama-server default: `32` per slot) saves
-snapshots of KV/recurrent state so a request can rewind instead of
-reprocessing from scratch. On this model's hybrid linear-attention/
-gated-attention (Gated DeltaNet-style) architecture, checkpoints are
-currently **known-broken upstream**: they get created (consuming RAM) but
-are constantly invalidated and never successfully restored - see
-[ggml-org/llama.cpp#24055](https://github.com/ggml-org/llama.cpp/issues/24055)
-and [#19794](https://github.com/ggml-org/llama.cpp/issues/19794), both
-filed against this exact model family. Confirmed directly against this
-repo's own logs, not just the upstream reports: not a single "checkpoint"
-or "restoring" log line appears anywhere in this server's history, and the
-exact same full-context-reprocess pattern (see below) happened identically
-before `LLAMA_CTX_CHECKPOINTS=0` was set as after. Until upstream fixes
-hybrid/recurrent checkpoint restore, this is pure memory overhead with no
-downside to disabling it. If a fix lands, it's worth re-enabling and
-re-testing (checkpoints are also the mechanism behind fast context-shift on
-`--context-shift`, unused here, and multi-turn prompt reuse in general).
+snapshots of KV/recurrent state so a request can resume instead of
+reprocessing from scratch. This repo set it to `0` on all three deployments
+between 2026-07-23 and 2026-07-25, believing it was pure overhead on this
+model's hybrid architecture. **That was wrong, and it was expensive.**
+
+Checkpoints are the mechanism the prompt cache (`--cache-ram`, below) needs
+to restore a branch. Recurrent state cannot be rewound the way attention KV
+can, so without a checkpoint there is nothing to resume *from* - the server
+recognises the cached prefix and then reprocesses all of it anyway.
+
+Measured on `limited` at llama.cpp b10087, alternating between two
+independent conversations (the orchestrator<->subagent handoff this repo
+cares about), varying only `--ctx-checkpoints`:
+
+| `--ctx-checkpoints` | returning to a cached branch | prefill |
+|---:|---|---|
+| `0` | 11431 of 11431 tokens reprocessed | **12.97 s** |
+| `4` | 25 tokens | 0.31 s |
+| `8` | 25 tokens | 0.26 s |
+| `32` | 25 tokens | 0.29 s |
+
+Only `0` behaves differently. Any non-zero value captures the whole benefit,
+and **`N` is a ceiling, not a reservation** - checkpoints are allocated on
+demand, and `4`, `8` and `32` measured an identical 1190 MiB of anonymous
+growth on that workload. So the cost of a generous value is zero until a
+session actually has that many divergence points to keep.
+
+Two things made the old conclusion look plausible, both worth knowing:
+
+- **An append-only conversation reuses its prefix fine without checkpoints.**
+  In a ten-turn chat with `--ctx-checkpoints 0`, only turn 2 fully
+  reprocesses; from turn 3 on, each turn reprocesses just the newly appended
+  text (20.2% of all prompt tokens, versus 18.4% with checkpoints on). If you
+  benchmark only a growing single conversation, checkpoints look nearly
+  worthless. The cost shows up when a prompt *diverges* or when you switch
+  branches - which is most real agent traffic.
+- **The absence of log lines proved nothing.** The previous text cited "not a
+  single 'checkpoint' or 'restoring' log line anywhere in this server's
+  history" as confirmation. This build emits no such lines at default
+  verbosity *even in runs where restore demonstrably works*, so that evidence
+  never distinguished the two cases.
+
+The upstream reports
+([ggml-org/llama.cpp#24055](https://github.com/ggml-org/llama.cpp/issues/24055),
+[#19794](https://github.com/ggml-org/llama.cpp/issues/19794)) may still be
+accurate about context *shift* on this architecture - that is a different
+operation and is not used here (`--context-shift` is off). They are not
+evidence that prefix restore is broken; it isn't.
+
+Current values: `32` on `full-128k`/`full-256k` (llama-server's own default),
+`8` on `limited` - a tighter ceiling for the desktop-sharing profile, which
+costs nothing measurable given its documented 2-branch working set.
 
 ### Prompt cache (`--cache-ram`): sized per-deployment for actual working set, not minimized
 
@@ -369,6 +436,16 @@ turning a few-second cache hit into a 90+ second full reprocess of tens of
 thousands of tokens. Confirmed in this server's own logs: the rate of full
 (>10k token) reprocesses roughly doubled (6.65% of requests -> 12.5%)
 after the cut, at matched request throughput.
+
+> **Caveat on the numbers in this subsection.** The 1024-vs-8192 comparison
+> above was measured while `--ctx-checkpoints` was `0`, i.e. while branch
+> restore was mostly broken (see the section above). The reprocess rates were
+> really observed, but *why* they moved is now unclear - with checkpoints
+> disabled the cache could rarely restore a branch regardless of its size.
+> The per-branch cost derivation below is from the GGUF's own metadata and is
+> unaffected. Re-validate the sizing itself now that checkpoints are on;
+> cached entries also carry checkpoint state, so a given `--cache-ram` holds
+> somewhat fewer branches than the table implies.
 
 The right number comes from what a single branch actually costs, computed
 from this GGUF's own architecture metadata (`qwen35moe`, read directly from
@@ -399,18 +476,110 @@ RAM a bigger cache would have reserved - rather than provisioning it for
 branch counts or context sizes it never actually uses - is the point, not
 a compromise.
 
+### `--cache-reuse`: refused by this model, absent on purpose
+
+**`--cache-reuse`** (llama.cpp default: `0`, off) is *not* passed by this
+repo, and that's a deliberate result rather than an oversight - noting it
+here because its absence otherwise looks like something nobody considered.
+
+It's a different mechanism from `--cache-ram` above, which is why having one
+says nothing about needing the other:
+
+- `--cache-ram N` - stores whole evicted slot states in host RAM.
+- `--cache-reuse N` - after a prompt diverges *mid-way*, reuses the cached
+  chunk past the divergence point by KV-shifting the remainder into place.
+
+KV shifting isn't supported on recurrent layers, and this is a hybrid model
+(`full_attention_interval=4`, see the derivation above), so the flag has
+nothing it can act on. Tested directly on the `limited` deployment at
+llama.cpp b10087 by passing `LLAMA_EXTRA_ARGS="--cache-reuse 256"`; the
+server accepts the argument and then disables it at load:
+
+```
+W srv    load_model: cache_reuse is not supported by this context, it will be disabled
+```
+
+So there is no setting to tune and no measurement to repeat - it is inert on
+this architecture until upstream supports shifting recurrent state. Don't
+re-add it expecting a prefill win.
+
 ### Baseline footprint (not fixed by either flag above)
 
 Even with both of the above set well, the model's baseline footprint is
-substantial on its own: the `limited` deployment was observed at
-~17-20GB RSS with checkpoints disabled (before any `--cache-ram` growth),
-on a 31GB-RAM machine. That's inherent to running a 22GB+ GGUF with
+substantial on its own: the `limited` deployment rests at **18.2 GB**
+`memory.current` after load, before any `--cache-ram` growth, on a 31GB-RAM
+machine. That's inherent to running a 22GB+ GGUF with
 several MoE layers CPU-resident (`-ncmoe`), not something `--cache-ram` or
 `--ctx-checkpoints` can fix - if you need more desktop headroom than the
 current profile leaves, the lever is raising `-ncmoe` further (more VRAM
 used, more speed given up), and accept less multi-branch cache headroom by
 lowering `--cache-ram` back down with the tradeoff above in mind, rather
 than assuming there's a free reduction available.
+
+**Measure this with `memory.current`, not `anon`.** The host-side weights
+land in **shmem**, not anonymous memory - on `limited` at rest, `memory.stat`
+reports ~16.9 GB `shmem` against only ~1.1 GB `anon` (`RssShmem` 16.5 GB,
+`RssAnon` 1.1 GB, `VmRSS` 17.9 GB). Two consequences:
+
+- Judging the footprint by `anon` makes it look like ~0.5 GB and hides
+  essentially the entire model. `anon` is still the right lens for the part
+  that *grows* with tuning (prompt cache + checkpoints), just not for the total.
+- shmem is charged to the cgroup and can only be evicted to swap, so it is
+  not the cheaply-reclaimable page cache it might look like. `MemoryHigh`/
+  `MemoryMax` act on `memory.current`, which includes it - that is the number
+  those ceilings must be sized against.
+
+**A climbing `memory.events` `high` counter is not automatically a problem.**
+Elsewhere this README treats it as evidence a ceiling is too tight, which is
+right when the pressure is anonymous memory - but check *what* is being
+reclaimed before acting. On `limited` at rest the split is roughly:
+
+```
+anon           1.5 GB   prompt cache + checkpoints  (the part tuning moves)
+shmem         15.8 GB   model weights, swap-only
+inactive_file  6.5 GB   leftover page cache from reading the GGUF
+```
+
+That `inactive_file` is a second copy of a file whose contents are already
+resident in shmem - an artifact of `--no-mmap` reading 22GB through the page
+cache. Reclaiming it is free, so the cgroup can sit against `MemoryHigh` with
+tens of thousands of `high` events while `memory.swap.current` stays near
+zero and nothing is actually hurting. Confirm with `memory.swap.current` and
+the `oom_kill` counter (both should stay ~0) before concluding a ceiling
+needs raising.
+
+### `--cache-ram` is a cap, not a reservation
+
+Worth stating plainly, because it inverts the intuition that lowering it
+"saves memory". Measured on `limited` (ctx-checkpoints=8), same 3-branch
+workload each time - three independent 34k-token conversations cycled twice,
+so every step is a return to a branch the slot no longer holds:
+
+| `--cache-ram` | restore hit rate | evictions | anon growth | behaviour |
+|---:|---|---:|---:|---|
+| `8192` | 6/6 | 0 | 2515 MiB | cap never reached |
+| `3072` | 6/6 | 0 | 2550 MiB | fits, ~500 MiB spare |
+| `1024` | **0/6** | 7 | 1796 MiB | thrashing - every switch reprocesses |
+| `512` | **0/6** | 0 | 795 MiB | entry never fits; nothing is cacheable |
+
+The workload allocated the same ~2.5 GiB under an 8192 ceiling as under a
+3072 one. **Raising this number costs nothing until the workload actually
+uses it**; lowering it reclaims nothing until you cross the threshold, and
+then the cache fails abruptly rather than degrading. Dropping 3072 -> 1024
+freed 754 MiB and turned all six branch switches into ~40s full reprocesses.
+
+Two consequences for sizing:
+
+- The limiting factor is the systemd `MemoryMax` below, not this value. Size
+  `--cache-ram` to the working set and let the cgroup cap be the guard.
+- `--cache-ram` does **not** bound total memory. At a 1024 MiB cap anon still
+  reached 1796 MiB, because the active slot's own state and its checkpoints
+  live outside the prompt cache.
+
+Note also that a cache entry is dominated by fixed per-branch cost, not token
+count: a 34k-token branch measured ~838 MiB, of which only ~364 MiB is
+attention KV at the 11 KiB/token derived above. Real sessions here run
+43-52k-token branches, so budget ~1.1 GiB per resident branch.
 
 ### systemd memory caps: the actual safety net
 
@@ -423,11 +592,47 @@ OOM, as a last resort). Each unit's ceiling is sized for that deployment's
 own baseline-footprint-plus-worst-case-cache (see the table above for what
 each one's cache budget actually is), not one shared number:
 
-| Deployment | `MemoryHigh` | `MemoryMax` | Notes |
-|---|---:|---:|---|
-| `full-128k` | `28G` | `30G` | raised after `full-128k`'s original 26G/28G (matching `limited`'s at the time) turned out to throttle real usage at `cache-ram=8192` - see below |
-| `full-256k` | `29G` | `30G` | only a small bump (not the same +2G as full-128k): total system RAM is 31Gi, and going further would leave `MemoryMax` so close to total that the cgroup could never actually reach it before the whole system hit global exhaustion first - the cap would stop meaning anything |
-| `limited` | `25G` | `27G` | *lowered* from full-128k/256k's ceiling to match its smaller `cache-ram=3072` - this profile gives RAM back to the desktop rather than reserving headroom it doesn't need |
+| Deployment | `MemoryHigh` | `MemoryMax` | `MemorySwapMax` | Notes |
+|---|---:|---:|---:|---|
+| `full-128k` | `28G` | `30G` | `0` | runs only under `multi-user.target`, so nothing else is competing for RAM and a high ceiling is fine |
+| `full-256k` | `29G` | `30G` | `0` | same - `multi-user.target` only. Do not copy these numbers to a profile that runs alongside a desktop |
+| `limited` | `21G` | `23G` | `0` | **the graphical.target profile.** Sized from measurement to leave ~8GB of the 31Gi box for the desktop - see below |
+
+**`limited` is the profile that needs a real ceiling, and it is the
+hungriest.** Despite the name, it keeps *more* MoE layers on the CPU
+(`ncmoe=33`) than `full-128k` (27) or `full-256k` (32), because it runs on
+`graphical.target` where the GPU is busy. So it uses the most host RAM, while
+being the only one competing with a live desktop session. Its ceilings were
+`25G`/`27G`, leaving ~4GB for everything else on a 31Gi machine - the regime
+where the kernel starts failing allocations for *other* processes. Observed
+symptoms of that were a sound card vanishing and a password manager unable to
+open its database: system-wide allocation failure, not a crash of this
+service. Measured sizing:
+
+```
+resting          15.74 shmem + 0.50 anon = 16.24 GB
+worst case seen  15.76 shmem + 2.98 anon = 18.74 GB   (3 x 34k-token branches)
+```
+
+`21G`/`23G` clears that worst case and leaves ~8GB for the desktop. Verified
+free: prefill under the tighter caps measured 46.1/45.7/45.2s against
+46.0/45.5/44.9s under the old `25G`/`27G` - identical, with the cache still
+at a 6/6 restore rate.
+
+#### `MemorySwapMax=0` - without it, `MemoryMax` is not a bound
+
+Swap on this box is **zram** (`/dev/zram0`) - compressed RAM, not disk - and
+cgroups default to `memory.swap.max=max`. That combination silently defeats
+the safety net: under pressure the kernel relocates anon/shmem into zram,
+which removes it from `memory.current`, so `MemoryMax` never trips and no
+restart ever happens - while those pages still occupy physical RAM, merely
+charged outside this cgroup. The service escapes its own cap and the
+shortfall lands on the desktop.
+
+Setting `MemorySwapMax=0` makes the accounting honest: this service's RAM use
+*is* `memory.current`, hard-capped, and a genuine runaway gets OOM-killed and
+restarted (bounded by `StartLimitBurst`) instead of quietly consuming the
+machine. Check `memory.swap.current` and `oom_kill` - both should stay ~0.
 
 That "throttle at cache-ram=8192" finding came from
 `cat /sys/fs/cgroup/.../llama-server-<profile>.service/memory.events` -

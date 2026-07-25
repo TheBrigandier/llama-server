@@ -65,9 +65,14 @@ Options (each has a matching LLAMA_* environment variable, see below):
   --cache-ram N              Max prompt-cache size in MiB, -1 no limit, 0 disable
                                 (default: 8192 - llama-server's own default)
   --ctx-checkpoints N        Max context checkpoints per slot (default: 32 -
-                                llama-server's own default; see README's Memory
-                                stability section for why hybrid/recurrent
-                                models like this one should usually set 0)
+                                llama-server's own default). Keep this NON-ZERO:
+                                on this hybrid/recurrent model it's what lets
+                                the prompt cache resume a branch instead of
+                                reprocessing it whole. It's a ceiling, not a
+                                reservation (allocated on demand), so a high
+                                value is free until a session needs it. See
+                                README's Memory stability section for the
+                                measurement.
   --spec-type TYPE          Speculative decoding type (default: draft-mtp)
   --spec-draft-n-max N      Max speculative draft tokens (default: 4 - tuned
                               by testing; accept rate falls off sharply at 5)
@@ -75,6 +80,14 @@ Options (each has a matching LLAMA_* environment variable, see below):
   --top-p N                 Top-p sampling (default: 0.95)
   --top-k N                 Top-k sampling (default: 20)
   --presence-penalty N      Presence penalty (default: 1.5)
+                              The four above are per-request DEFAULTS, not a
+                              deployment-wide policy: any API client that
+                              sends its own sampler block in the request body
+                              overrides them, and most coding agents send one
+                              on every call. They apply to raw curl and to
+                              clients that stay silent. Tune an agent's
+                              sampling in that agent's own config; check
+                              /slots (not /props) to see what really applied.
   --host HOST               Bind address (default: 0.0.0.0)
   --port PORT               Bind port (default: 8080)
   --api-key-file PATH        File of bearer API keys, one per line, llama-server's

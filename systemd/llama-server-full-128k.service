@@ -3,6 +3,27 @@ Description=llama-server (profile: full-128k) - primary daily-driver config
 Documentation=file:%h/llama-server/README.md
 # Only one profile should run at a time; starting this one stops the others.
 Conflicts=llama-server-full-256k.service llama-server-limited.service
+# Give up instead of restarting forever on a *persistent* failure. systemd's
+# defaults here (verified on this box with `systemctl --user show -p
+# DefaultStartLimitIntervalUSec -p DefaultStartLimitBurst`: 10s / 5) can
+# never be tripped by this unit, because RestartSec is longer than
+# interval/burst - at one restart per 5s only 2 starts land in a 10s window,
+# the counter resets, and a unit that fails every single time restarts
+# indefinitely. The realistic persistent failure on this box is the cgroup
+# OOM kill that MemoryMax below is *designed* to cause, and each iteration
+# re-reads 22GB from disk under --no-mmap, so the safety net would otherwise
+# become the trigger for an unbounded reload loop. At RestartSec=30 a
+# genuinely broken config burns its 5 tries in ~2 minutes, then enters
+# `failed` and stays there for a human (`systemctl --user reset-failed
+# <unit>` to clear).
+#
+# 5/300 rather than a tighter 3/600 because *manual* restarts count toward
+# this limit too, and this repo's workflow is "edit the tunables file,
+# restart, observe". 3-per-10-minutes was tried first and blocked a
+# legitimate tuning session on the fourth restart - tight enough to stop a
+# crash loop is not the same as tight enough to fight the operator.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -13,11 +34,23 @@ WorkingDirectory=%h/llama-server
 # install.sh has been run.
 ExecStart=%h/llama-server/scripts/llm-server.sh --tunables-file %h/.config/llama-server/full-128k.env
 Restart=on-failure
-RestartSec=5
-# Model load (22GB, --no-mmap) plus KV cache allocation can take a while.
-TimeoutStartSec=300
+# 30s, not 5s: a restart here re-reads 22GB from disk under --no-mmap, so
+# retrying in 5s only piles a second cold load onto a box that may still be
+# recovering from whatever killed the first one. Costs nothing on a genuine
+# transient, and keeps RestartSec well inside the StartLimit window above.
+RestartSec=30
+# No TimeoutStartSec here on purpose. It used to be 300, described as
+# covering the 22GB model load - it never did: under Type=simple systemd
+# marks the unit active the moment the fork succeeds, so nothing is timed
+# during load (Type=exec wouldn't help either, it only waits for exec()).
+# With it gone the unit inherits DefaultTimeoutStartUSec, 15s on this box,
+# which is equally inert for the same reason. If Type= ever becomes notify
+# or an ExecStartPre/ExecStartPost is added, that 15s default *will* apply
+# and must be raised past the real load time before anything else changes.
+# Making start completion mean "model loaded" needs an ExecStartPost that
+# polls /health, not a timeout.
 # Safety net for a desktop box also used for browsing: cap this cgroup so a
-# runaway (this model's context-checkpoint bug or anything else) gets killed
+# runaway (a genuine leak, a bad tunable, anything else) gets killed
 # and restarted by systemd instead of taking down the whole session via the
 # system-wide OOM killer. This profile's baseline RAM hasn't been directly
 # measured (fewer ncmoe layers stay on CPU here than limited's, so likely
@@ -31,6 +64,19 @@ TimeoutStartSec=300
 # `systemctl --user status llama-server-full-128k` peak memory and adjust.
 MemoryHigh=28G
 MemoryMax=30G
+# Without this, MemoryMax above is NOT a real bound. Swap on this box is zram
+# (/dev/zram0, compressed RAM - not disk) and the cgroup defaults to
+# memory.swap.max=max, so under pressure the kernel relocates anon/shmem into
+# zram, dropping it out of memory.current: MemoryMax never trips, no restart
+# happens, and the pages still occupy physical RAM charged outside this
+# cgroup. 0 keeps the accounting honest - a genuine runaway is OOM-killed and
+# restarted (see StartLimit above) rather than quietly eating the box.
+#
+# The ceilings above stay high (unlike `limited`'s 20G/22G) because this
+# profile only runs under multi-user.target, with no desktop session
+# competing for RAM. Don't copy these numbers to a profile that runs on
+# graphical.target.
+MemorySwapMax=0
 # Prefer the kernel kill *this* process over other apps in a system-wide OOM,
 # since it's expendable (Restart=on-failure brings it back) and your desktop
 # session isn't.

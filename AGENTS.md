@@ -42,15 +42,28 @@ only the relevant `.env` file.
   value of `2` - this was tuned by testing on this model/hardware (good
   speedup at 4, accept rate falls off sharply at 5). Don't "fix" it back to
   match the card without new evidence.
-- **`LLAMA_CTX_CHECKPOINTS=0` is set in every `config/*.env.example`**,
-  overriding llama-server's own default (`32`) - context checkpoints are
-  known-broken upstream on this model's hybrid/recurrent architecture
-  (created but never successfully restored - see README's "Memory
-  stability" section and the linked llama.cpp issues), confirmed against
-  this repo's own logs (zero "checkpoint"/"restoring" lines ever, same
-  full-reprocess pattern before and after disabling), so this is pure RAM
-  overhead with no tradeoff. If an upstream fix lands, re-enabling and
-  re-testing is reasonable - don't just revert silently.
+- **`LLAMA_CTX_CHECKPOINTS` must stay non-zero** (`32` on
+  `full-128k`/`full-256k`, `8` on `limited`). This repo shipped `0`
+  everywhere from 2026-07-23 to 2026-07-25 on the belief that checkpoints
+  never restore on this architecture; that was measured false on 2026-07-25
+  and the setting cost real performance. Checkpoints are the mechanism the
+  prompt cache needs to restore a branch - recurrent state can't be rewound,
+  so with `0` there is nothing to resume from and the server reprocesses a
+  cached branch in full (11-14k tokens, 13-16s, versus 25 tokens / 0.3s with
+  any non-zero value). See README's "Memory stability" section for the table.
+  Do not set this back to `0` without a measurement that beats that one.
+- **Don't treat a missing log line as evidence.** The `0` mistake above came
+  from concluding checkpoints never restore because no
+  `checkpoint`/`restoring` lines appeared in the server's history. This build
+  emits none at default verbosity even when restore provably works. Verify
+  behaviour by measuring `prompt_n` from a request's `timings` block (the
+  non-streamed response carries it) against a known-cached prefix, not by
+  grepping logs for a message that may not exist.
+- **Benchmark branch switching, not just a growing chat.** An append-only
+  conversation reuses its prefix fine even with checkpoints off (only turn 2
+  suffers), so a single-conversation test hides this whole class of problem.
+  The workload that exposes it is alternating between two distinct prefixes,
+  which is what the orchestrator<->subagent handoff actually does.
 - **`LLAMA_CACHE_RAM` is set explicitly in every `config/*.env.example`, but
   is NOT the same value across all three** - don't "consolidate" it back to
   one number. `full-128k`/`full-256k` use `8192` (llama-server's own
@@ -74,6 +87,28 @@ only the relevant `.env` file.
   RAM on `full-128k`/`full-256k`, that's a real tradeoff to make
   deliberately (and adjust the systemd `MemoryHigh`/`MemoryMax` caps to
   match - see the next bullet), not a default to "clean up."
+- **`limited` is the `graphical.target` profile and the most host-RAM-hungry
+  of the three** - `ncmoe=33` keeps more MoE layers on CPU than `full-128k`
+  (27) or `full-256k` (32), because the GPU is busy serving a desktop. The
+  full profiles only run under `multi-user.target`. **Never start a `full-*`
+  unit to test something while a desktop session is running** - it will fail
+  to load, and `Conflicts=` will have stopped `limited` on the way. Measure on
+  `limited`.
+- **`MemorySwapMax=0` must stay set on every unit.** Swap here is zram
+  (compressed RAM, not disk) and cgroups default to `memory.swap.max=max`,
+  which lets the cgroup push pages into zram, out of `memory.current`, so
+  `MemoryMax` never trips while the RAM is still consumed - charged outside
+  the cgroup. Without this line the memory caps are decorative. Verified by
+  the failure it caused: desktop-wide allocation failures (sound card
+  disappearing, password manager unable to open its DB) with `oom_kill` at 0
+  and no service restart.
+- **`--cache-ram` is a cap, not a reservation - don't "save" memory with it.**
+  The same workload allocated 2515 MiB under `8192` and 2550 MiB under `3072`.
+  Lowering it frees nothing until the working set crosses it, and then the
+  cache fails abruptly: `3072`->`1024` freed 754 MiB and took the branch-restore
+  hit rate from 6/6 to 0/6 (every switch a ~40s full reprocess). It also does
+  not bound total memory - the active slot and its checkpoints sit outside the
+  prompt cache. Size it to the working set and let `MemoryMax` be the guard.
 - **systemd `MemoryHigh`/`MemoryMax` differ per deployment and aren't
   arbitrary either** - `full-128k` (28G/30G) and `full-256k` (29G/30G) are
   sized for baseline + up to their 8192 MiB cache; `limited` (25G/27G) is
